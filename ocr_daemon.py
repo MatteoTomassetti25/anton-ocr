@@ -121,40 +121,44 @@ _COMPLEX_RE = re.compile(
     r"\|.*?\|"                   # matrix/determinant notation
 )
 
-# ─────────────────── OCR PROMPT ───────────────────────────
-# GLM-OCR is a specialized OCR model that responds to the
-# "Text Recognition:" trigger. Long instruction paragraphs cause
-# the model to echo the instructions back instead of extracting.
-# Keep prompt short, starting with the native trigger phrase.
+# ─────────────────── OCR PROMPTS ─────────────────────────
+# GLM-OCR responds to "Text Recognition:" as native trigger.
+# Keep short to avoid echo.
 OCR_PROMPT = (
     "Text Recognition: Extract ALL content from this image. "
-    "Rules: "
-    "(1) Mathematical formulas → LaTeX ($inline$ or $$block$$). "
-    "(2) Tables → Markdown table syntax. "
-    "(3) Diagrams/graphs → bullet list describing elements, axes, labels. "
-    "Output ONLY the extracted Markdown, no explanations."
+    "Mathematical formulas → LaTeX ($inline$ / $$block$$). "
+    "Tables → Markdown table. "
+    "Output ONLY extracted Markdown."
 )
 
-# Phrases that indicate the model echoed the prompt back instead of
-# extracting content (happens on purely visual pages with no text).
+# Fallback prompt when OCR returns empty (purely visual pages).
+# GLM-4V (base of GLM-OCR) is a general VLM and can describe images.
+DESCRIPTION_PROMPT = (
+    "Describe in detail ALL visual content on this page in structured Markdown. "
+    "Include: mathematical/geometric diagrams with their labels and properties, "
+    "graph axes, curve shapes and notable points, arrow directions and meaning, "
+    "any mathematical notation in LaTeX ($$...$$). "
+    "Structure the output with bullet points and headers. "
+    "This text will be read by an AI agent — be thorough and precise."
+)
+
+# Markers that indicate the model echoed the prompt instead of extracting.
 _PROMPT_ECHO_MARKERS = [
     "Text Recognition: Extract",
-    "Rules: ",
-    "Mathematical formulas → LaTeX",
+    "Mathematical formulas →",
     "Tables → Markdown",
-    "Diagrams/graphs → bullet",
-    "Output ONLY the extracted",
+    "Output ONLY extracted",
+    "Describe in detail ALL visual",
+    "This text will be read by an AI",
 ]
 
 def _clean_ocr_output(raw: str) -> str:
     """Strip markdown wrapper and detect prompt echo — return empty string if echo."""
-    # 1. Strip ```markdown ... ``` wrapper
     text = re.sub(r'^```(?:markdown)?\n?', '', raw.strip(), flags=re.IGNORECASE)
     text = re.sub(r'\n?```$', '', text.strip()).strip()
-    # 2. Anti-echo: if output contains our prompt keywords it's not real content
     head = text[:300].lower()
     if any(marker.lower() in head for marker in _PROMPT_ECHO_MARKERS):
-        return ""  # Treat as empty — fallback to image embed
+        return ""
     return text
 
 def ts() -> str:
@@ -231,7 +235,9 @@ def page_to_b64(page) -> str:
 
 # ─────────────────── ASYNC OCR ───────────────────────
 def _ocr_page_mlx_sync(b64: str) -> str:
-    """MLX native inference — runs in thread executor (MLX is not async).
+    """MLX native inference with two-pass strategy:
+    Pass 1: OCR extraction (text/formulas/tables)
+    Pass 2: Visual description if OCR returns empty (diagrams/graphs)
     mlx-vlm v0.4.x signature: generate(model, processor, prompt, image=path)
     """
     import tempfile, os as _os
@@ -241,32 +247,36 @@ def _ocr_page_mlx_sync(b64: str) -> str:
 
     _load_mlx_model()  # Lazy load on first call
 
-    # mlx-vlm 0.4.x needs a file path for 'image', not a PIL object
     img_bytes = base64.b64decode(b64)
     tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
     try:
         tmp.write(img_bytes)
         tmp.close()
-
         config = load_config(_MLX_HF_MODEL)
-        prompt = apply_chat_template(
-            _mlx_processor, config,
-            OCR_PROMPT, num_images=1
-        )
-        # v0.4.x: (model, processor, prompt, image=path)
-        result = generate(
-            _mlx_model, _mlx_processor,
-            prompt,
-            image=tmp.name,
-            max_tokens=2048,
-            verbose=False
-        )
+
+        def _run(prompt_text: str) -> str:
+            prompt = apply_chat_template(
+                _mlx_processor, config, prompt_text, num_images=1
+            )
+            res = generate(
+                _mlx_model, _mlx_processor,
+                prompt, image=tmp.name,
+                max_tokens=2048, verbose=False
+            )
+            raw = res.text if hasattr(res, "text") else str(res)
+            return _clean_ocr_output(raw)
+
+        # Pass 1: OCR (text, formulas, tables)
+        text = _run(OCR_PROMPT)
+
+        # Pass 2: Visual description if OCR found nothing
+        if not text.strip():
+            text = _run(DESCRIPTION_PROMPT)
+
     finally:
         _os.unlink(tmp.name)
 
-    # Extract text from GenerationResult and clean output
-    raw = result.text if hasattr(result, "text") else str(result)
-    return _clean_ocr_output(raw)
+    return text
 
 async def ocr_page_async(client: ollama.AsyncClient, b64: str, page_num: int, total: int) -> str:
     """Single-page OCR — MLX on Apple Silicon (single thread), Ollama on NVIDIA/CPU."""
@@ -364,15 +374,9 @@ async def process_pdf(filepath: str):
                 if text.strip():
                     full_markdown += text.strip() + "\n\n---\n\n"
                 elif classifications[idx] == "vision":
-                    # Model returned nothing even with rich prompt — embed image as fallback
-                    img = page_images.get(idx)
-                    if img:
-                        asset_name = f"{stem}_p{idx+1:03d}.jpg"
-                        asset_path = assets_dir / asset_name
-                        img.save(str(asset_path), format="JPEG", quality=90)
-                        full_markdown += f"![[{asset_name}]]\n\n---\n\n"
-                    else:
-                        full_markdown += f"*[Pagina {idx+1}: nessun contenuto estratto]*\n\n---\n\n"
+                    # Both OCR and description pass returned empty
+                    # (truly blank page or model failure) — skip silently
+                    log(f"  WARN: pagina {idx+1} non ha prodotto testo (pagina visiva vuota?)")
 
             pages_done += len(chunk_slice)
             elapsed     = time.time() - t0
