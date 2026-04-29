@@ -290,16 +290,16 @@ async def process_pdf(filepath: str):
 
             vision_in_chunk = [i for i, c in zip(chunk_slice, chunk_class) if c == "vision"]
 
-            # Lazy load images only for pages that need vision OCR
+            # Lazy load images — one page at a time for vision pages ONLY.
+            # Loading a range (first_v..last_v) is wrong because it includes
+            # native-text pages in between, breaking the index mapping.
             page_images = {}
             if vision_in_chunk:
-                first_v = vision_in_chunk[0] + 1
-                last_v  = vision_in_chunk[-1] + 1
-                imgs = convert_from_path(filepath, dpi=DPI,
-                                         first_page=first_v, last_page=last_v)
-                for rel_i, img in enumerate(imgs):
-                    abs_i = vision_in_chunk[rel_i]
-                    page_images[abs_i] = img
+                for v_idx in vision_in_chunk:
+                    imgs = convert_from_path(filepath, dpi=DPI,
+                                             first_page=v_idx + 1,
+                                             last_page=v_idx + 1)
+                    page_images[v_idx] = imgs[0]  # exactly 1 page returned
 
             # Build async tasks for vision pages in this chunk
             vision_tasks = {
