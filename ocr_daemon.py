@@ -5,7 +5,8 @@ High-performance async pipeline:
   - asyncio.gather + Semaphore(3) for concurrent OCR
   - Per-page intelligent tiering (native text vs glm-ocr vision)
   - Lazy chunked image loading (CHUNK_SIZE pages at a time)
-  - Hardware-aware: Apple Silicon (keep_alive=-1) vs NVIDIA/CPU
+  - Apple Silicon: MLX-VLM native inference (Neural Engine + GPU Metal)
+  - NVIDIA/CPU: Ollama backend
   - Idle VRAM unload after 5 min of inactivity
   - Graceful shutdown (completes current page before stopping)
 """
@@ -18,8 +19,32 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from pdf2image import convert_from_path, pdfinfo_from_path
 import fitz          # PyMuPDF — fast page-level analysis
-import ollama        # AsyncClient for concurrent calls
+import ollama        # AsyncClient for concurrent calls (NVIDIA/CPU backend)
 import requests as req
+
+# MLX-VLM — Apple Silicon native inference
+_mlx_model = None
+_mlx_processor = None
+_MLX_HF_MODEL = "mlx-community/GLM-OCR-8bit"  # 8-bit: best quality/VRAM ratio
+
+def _load_mlx_model():
+    """Lazily load MLX model on first use."""
+    global _mlx_model, _mlx_processor
+    if _mlx_model is not None:
+        return
+    from mlx_vlm import load
+    log(f"Caricamento MLX model: {_MLX_HF_MODEL} (primo avvio, attendi...)")
+    _mlx_model, _mlx_processor = load(_MLX_HF_MODEL)
+    log("MLX model caricato nel Neural Engine/GPU Metal.")
+
+def _unload_mlx_model():
+    """Release MLX model from unified memory."""
+    global _mlx_model, _mlx_processor
+    import mlx.core as mx
+    _mlx_model = None
+    _mlx_processor = None
+    mx.clear_cache()
+    log("MLX memory liberata (mx.clear_cache).")
 
 # ─────────────────── CONFIGURATION ───────────────────
 def load_config():
@@ -69,9 +94,10 @@ try:
 except Exception:
     pass
 
-# Apple Silicon: keep model in VRAM indefinitely between files (-1 = forever)
-# Other hardware: keep 5 min after last use
-KEEP_ALIVE = -1 if IS_APPLE_SILICON else 300
+# Apple Silicon → MLX native inference (Neural Engine + GPU Metal, unified memory)
+# NVIDIA/CPU    → Ollama backend
+USE_MLX = IS_APPLE_SILICON
+KEEP_ALIVE = 300  # Only used by Ollama fallback path
 
 # ─────────────────── GLOBALS ──────────────────────────
 _loop: asyncio.AbstractEventLoop = None
@@ -107,22 +133,28 @@ def send_notification(title: str, msg: str):
 
 # ─────────────────── VRAM MANAGEMENT ─────────────────
 def _unload_vram_sync():
-    """Synchronous VRAM unload via REST API."""
-    try:
-        req.post(
-            f"{OLLAMA_HOST}/api/generate",
-            json={"model": MODEL_ID, "keep_alive": 0},
-            timeout=10
-        )
-        log(f"VRAM liberata: {MODEL_ID} scaricato.")
-    except Exception as e:
-        log(f"WARN: impossibile liberare VRAM: {e}")
+    """Unload model from memory (MLX or Ollama depending on hardware)."""
+    global _model_loaded
+    if USE_MLX:
+        try:
+            _unload_mlx_model()
+        except Exception as e:
+            log(f"WARN MLX unload: {e}")
+    else:
+        try:
+            req.post(
+                f"{OLLAMA_HOST}/api/generate",
+                json={"model": MODEL_ID, "keep_alive": 0},
+                timeout=10
+            )
+            log(f"Ollama VRAM liberata: {MODEL_ID} scaricato.")
+        except Exception as e:
+            log(f"WARN Ollama unload: {e}")
+    _model_loaded = False
 
 async def _unload_vram_async():
-    global _model_loaded
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _unload_vram_sync)
-    _model_loaded = False
 
 # ─────────────────── TIERING LOGIC ───────────────────
 def classify_pages(filepath: str) -> list[str]:
@@ -155,18 +187,43 @@ def page_to_b64(page) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 # ─────────────────── ASYNC OCR ───────────────────────
+def _ocr_page_mlx_sync(b64: str) -> str:
+    """MLX native inference — runs in thread executor (MLX is not async)."""
+    import mlx.core as mx
+    from mlx_vlm import generate
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from PIL import Image
+    import base64, io
+    _load_mlx_model()  # Lazy load on first call
+    img_bytes = base64.b64decode(b64)
+    image = Image.open(io.BytesIO(img_bytes))
+    prompt = apply_chat_template(
+        _mlx_processor, _mlx_model.config,
+        "Text Recognition:", num_images=1
+    )
+    result = generate(
+        _mlx_model, _mlx_processor, image,
+        prompt=prompt, max_tokens=2048, verbose=False
+    )
+    return result
+
 async def ocr_page_async(client: ollama.AsyncClient, b64: str, page_num: int, total: int) -> str:
-    """Single-page OCR call, rate-limited by semaphore."""
+    """Single-page OCR — MLX on Apple Silicon, Ollama on NVIDIA/CPU."""
     async with _ocr_semaphore:
-        log(f"  OCR pagina {page_num}/{total}...")
-        resp = await client.generate(
-            model=MODEL_ID,
-            prompt="Text Recognition:",
-            images=[b64],
-            keep_alive=KEEP_ALIVE,
-            options={"num_ctx": NUM_CTX, "temperature": 0}
-        )
-        return resp.response
+        log(f"  OCR pagina {page_num}/{total} ({'MLX' if USE_MLX else 'Ollama'})...")
+        if USE_MLX:
+            # MLX is synchronous — run in thread pool to avoid blocking event loop
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, _ocr_page_mlx_sync, b64)
+        else:
+            resp = await client.generate(
+                model=MODEL_ID,
+                prompt="Text Recognition:",
+                images=[b64],
+                keep_alive=KEEP_ALIVE,
+                options={"num_ctx": NUM_CTX, "temperature": 0}
+            )
+            return resp.response
 
 # ─────────────────── PDF PROCESSOR ───────────────────
 async def process_pdf(filepath: str):
@@ -346,7 +403,7 @@ async def amain():
     for d in [INPUT_DIR, OUTPUT_DIR, ARCHIVE_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
-    hw = "Apple Silicon (MPS)" if IS_APPLE_SILICON else ("NVIDIA GPU" if IS_NVIDIA else "CPU")
+    hw = f"Apple Silicon (MLX Native — {_MLX_HF_MODEL})" if USE_MLX else ("NVIDIA GPU (Ollama)" if IS_NVIDIA else "CPU (Ollama)")
     log(f"Anton OCR Daemon v3 — Online")
     log(f"Hardware    : {hw} | keep_alive={KEEP_ALIVE}s")
     log(f"Modello OCR : {MODEL_ID} | concurrency={OCR_CONCURRENCY} | chunk={CHUNK_SIZE} pag | DPI={DPI}")
