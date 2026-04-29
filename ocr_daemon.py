@@ -100,6 +100,16 @@ except Exception:
 USE_MLX = IS_APPLE_SILICON
 KEEP_ALIVE = 300  # Only used by Ollama fallback path
 
+# Visual description model — used when GLM-OCR returns empty (pure diagram/graph pages).
+# GLM-OCR = text/formula/table extraction | VISUAL_MODEL = diagram/graph description
+VISUAL_MODEL   = CFG.get("VISUAL_MODEL", "moondream:latest")
+VISUAL_PROMPT  = (
+    "Describe all mathematical and visual content in this image in detail. "
+    "Extract any formulas using LaTeX notation ($inline$ or $$block$$). "
+    "Describe diagrams, graphs, axes, labels, arrows and their mathematical meaning. "
+    "Output structured Markdown."
+)
+
 # ─────────────────── GLOBALS ──────────────────────────
 _loop: asyncio.AbstractEventLoop = None
 _pdf_queue: asyncio.Queue       = None
@@ -255,14 +265,17 @@ def _ocr_page_mlx_sync(b64: str) -> str:
     return _clean_ocr_output(raw)
 
 async def ocr_page_async(client: ollama.AsyncClient, b64: str, page_num: int, total: int) -> str:
-    """Single-page OCR — MLX on Apple Silicon (single thread), Ollama on NVIDIA/CPU."""
+    """Single-page OCR — two-model pipeline:
+    1. GLM-OCR  (MLX/Ollama): text, formulas, tables  → fast, specialized
+    2. Moondream (Ollama):    diagrams, graphs, images → fallback when GLM returns empty
+    """
     async with _ocr_semaphore:
-        log(f"  OCR pagina {page_num}/{total} ({'MLX' if USE_MLX else 'Ollama'})...")
+        log(f"  OCR pagina {page_num}/{total} ({'MLX+Moondream' if USE_MLX else 'Ollama'})...")
+
+        # ── Pass 1: GLM-OCR for text / formulas / tables ─────────────────
         if USE_MLX:
-            # Force all MLX calls onto the single dedicated thread (_MLX_EXECUTOR)
-            # This guarantees a consistent Metal GPU stream — MLX is NOT thread-safe
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(_MLX_EXECUTOR, _ocr_page_mlx_sync, b64)
+            text = await loop.run_in_executor(_MLX_EXECUTOR, _ocr_page_mlx_sync, b64)
         else:
             resp = await client.generate(
                 model=MODEL_ID,
@@ -271,7 +284,25 @@ async def ocr_page_async(client: ollama.AsyncClient, b64: str, page_num: int, to
                 keep_alive=KEEP_ALIVE,
                 options={"num_ctx": NUM_CTX, "temperature": 0}
             )
-            return resp.response
+            text = _clean_ocr_output(resp.response)
+
+        if text.strip():
+            return text
+
+        # ── Pass 2: Moondream for visual/diagram description ────────────
+        log(f"  → GLM vuoto — pass2 Moondream pagina {page_num}...")
+        try:
+            resp2 = await client.generate(
+                model=VISUAL_MODEL,
+                prompt=VISUAL_PROMPT,
+                images=[b64],
+                keep_alive=KEEP_ALIVE,
+                options={"temperature": 0}
+            )
+            return _clean_ocr_output(resp2.response)
+        except Exception as e:
+            log(f"  WARN Moondream pagina {page_num}: {e}")
+            return ""
 
 # ─────────────────── PDF PROCESSOR ───────────────────
 async def process_pdf(filepath: str):
@@ -350,13 +381,8 @@ async def process_pdf(filepath: str):
                 if text.strip():
                     full_markdown += text.strip() + "\n\n---\n\n"
                 elif classifications[idx] == "vision":
-                    # GLM-OCR returned empty: purely visual page (diagram/graph)
-                    # with no extractable text. Clean callout for AI agent context.
-                    full_markdown += (
-                        f"> [!NOTE] Slide grafica (pag. {idx+1})\n"
-                        f"> Pagina con contenuto visivo non estraibile (diagramma/grafico/immagine).\n"
-                        f"\n---\n\n"
-                    )
+                    # Both models returned empty — truly blank/unreadable page
+                    log(f"  WARN pag {idx+1}: nessun testo estratto da GLM-OCR né da Moondream")
 
             pages_done += len(chunk_slice)
             elapsed     = time.time() - t0
