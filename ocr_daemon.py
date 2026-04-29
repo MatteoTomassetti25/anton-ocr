@@ -12,6 +12,7 @@ High-performance async pipeline:
 """
 
 import asyncio
+import json
 import os, sys, time, gc, re, platform, shutil, subprocess, base64, io
 import threading
 from pathlib import Path
@@ -114,30 +115,35 @@ from concurrent.futures import ThreadPoolExecutor as _TPE
 _MLX_EXECUTOR  = _TPE(max_workers=1, thread_name_prefix="mlx_worker")
 _MLX_LOAD_LOCK = threading.Lock()  # Prevent concurrent lazy-loads
 
-# Math/table patterns that trigger vision OCR even on text-rich pages
-_COMPLEX_RE = re.compile(
-    r"[∫∑∂∇∈∉≤≥≠±∞∀∃√∆]|"      # math symbols
-    r"\\frac|\\int|\\sum|"       # LaTeX fragments
-    r"\|.*?\|"                   # matrix/determinant notation
+# Math/formula detection patterns
+_FORMULA_RE = re.compile(
+    r"[\u222b\u2211\u2202\u2207\u2208\u2209\u2264\u2265\u2260\u00b1\u221e\u2200\u2203\u221a\u0394]|"  # math symbols
+    r"\\frac|\\int|\\sum|\\prod|\\lim|\\nabla|\\partial|"                                             # LaTeX commands
+    r"\$[^\$]+\$|\$\$[^\$]+\$\$|"                                                                  # inline/block LaTeX
+    r"[a-z]\([a-z]\)|\bE\[|Var\(|P\(|\blim_"                                                       # math notation
 )
+# Simpler alias kept for backwards compat
+_COMPLEX_RE = _FORMULA_RE
 
-# ─────────────────── OCR PROMPT ─────────────────────────
-# GLM-OCR responds ONLY to its native trigger "Text Recognition:".
-# Any additional instructions cause the model to echo them back
-# instead of extracting content. Keep it to the bare trigger only.
-OCR_PROMPT = "Text Recognition:"
+# ─────────────────── GLM-OCR TASK SYSTEM ─────────────────
+# GLM-OCR supports task-specific prompts for document parsing.
+# Each prompt activates a different understanding mode.
+TASK_TEXT    = "text"     # plain narrative text  → fast PyMuPDF path
+TASK_FORMULA = "formula"  # math-dense pages       → Formula Recognition:
+TASK_TABLE   = "table"    # tabular data           → Table Recognition:
+TASK_VISUAL  = "visual"   # diagrams/images        → Text Recognition: (best effort)
 
-# Phrases that mean the model returned garbage instead of extracted content.
-_PROMPT_ECHO_MARKERS = [
-    "text recognition:",
-    "mathematical formulas →",
-    "tables → markdown",
-    "output only extracted",
-    "describe in detail",
-    "parabola, hyperbola, ellipse",
-    "graph axes: x-axis, y-axis",
-    "<|begin_of_image|>",
-]
+TASK_PROMPTS = {
+    TASK_TEXT:    "Text Recognition:",
+    TASK_FORMULA: "Formula Recognition:",
+    TASK_TABLE:   "Table Recognition:",
+    TASK_VISUAL:  "Text Recognition:",
+}
+
+# Input validation limits (from GLM-OCR documentation)
+MAX_PDF_MB    = 50
+MAX_IMG_MB    = 10
+MAX_PDF_PAGES = 100
 
 def _clean_ocr_output(raw: str) -> str:
     """Strip markdown wrapper and discard garbage/echo output."""
@@ -193,19 +199,56 @@ async def _unload_vram_async():
 # ─────────────────── TIERING LOGIC ───────────────────
 def classify_pages(filepath: str) -> list[str]:
     """
-    Pre-scan all pages with PyMuPDF (fast, low-RAM).
-    Returns a list with "native" or "vision" per page.
+    Multi-stage document layout analysis per page.
+    Routes each page to the correct GLM-OCR task:
+      'text'    → plain narrative text, fast PyMuPDF extraction
+      'formula' → math-dense page,   Formula Recognition:
+      'table'   → tabular data,       Table Recognition:
+      'visual'  → diagrams/figures,  Text Recognition: (best effort)
+    Priority: table > formula > text > visual
     """
     doc = fitz.open(filepath)
     result = []
     for page in doc:
-        text = page.get_text()
-        if len(text.strip()) >= TEXT_THRESHOLD and not _COMPLEX_RE.search(text):
-            result.append("native")
+        text = page.get_text().strip()
+
+        # 1. Table detection via PyMuPDF structural analysis
+        has_table = False
+        try:
+            tabs = page.find_tables()
+            has_table = len(tabs.tables) > 0
+        except Exception:
+            pass
+
+        # 2. Formula detection via regex on extracted text
+        has_formula = bool(_FORMULA_RE.search(text)) if text else False
+
+        # 3. Routing decision (priority: table > formula > text > visual)
+        if has_table:
+            result.append(TASK_TABLE)
+        elif has_formula:
+            result.append(TASK_FORMULA)
+        elif len(text) >= TEXT_THRESHOLD:
+            result.append(TASK_TEXT)
         else:
-            result.append("vision")
+            result.append(TASK_VISUAL)
+
     doc.close()
     return result
+
+def validate_pdf(filepath: str) -> tuple[bool, str]:
+    """Check input limits before processing (GLM-OCR API constraints)."""
+    size_mb = os.path.getsize(filepath) / 1_048_576
+    if size_mb > MAX_PDF_MB:
+        return False, f"PDF troppo grande ({size_mb:.1f}MB > {MAX_PDF_MB}MB limite)"
+    try:
+        info  = pdfinfo_from_path(filepath)
+        pages = int(info.get("Pages", 0))
+        if pages > MAX_PDF_PAGES:
+            return False, f"Troppe pagine ({pages} > {MAX_PDF_PAGES} limite)"
+    except Exception as e:
+        return False, f"Errore lettura PDF: {e}"
+    return True, ""
 
 def extract_native_text_page(filepath: str, page_idx: int) -> str:
     """Extract native text from a single page."""
@@ -221,10 +264,13 @@ def page_to_b64(page) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 # ─────────────────── ASYNC OCR ───────────────────────
-def _ocr_page_mlx_sync(b64: str) -> str:
-    """MLX native inference — single-pass OCR (text, formulas, tables).
-    GLM-OCR is NOT a captioning VLM: do not attempt image description,
-    it produces hallucinated generic content.
+def _ocr_page_mlx_sync(b64: str, task: str = TASK_VISUAL) -> str:
+    """MLX native inference with task-specific GLM-OCR prompt.
+    Tasks map directly to GLM-OCR's document understanding modes:
+      formula → Formula Recognition:  (equations, LaTeX)
+      table   → Table Recognition:    (grid structures → Markdown table)
+      visual  → Text Recognition:     (best-effort on diagrams/figures)
+      text    → Text Recognition:     (should not reach here; fast path)
     mlx-vlm v0.4.x signature: generate(model, processor, prompt, image=path)
     """
     import tempfile, os as _os
@@ -234,14 +280,15 @@ def _ocr_page_mlx_sync(b64: str) -> str:
 
     _load_mlx_model()
 
-    img_bytes = base64.b64decode(b64)
+    prompt_text = TASK_PROMPTS.get(task, "Text Recognition:")
+    img_bytes   = base64.b64decode(b64)
     tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
     try:
         tmp.write(img_bytes)
         tmp.close()
         config = load_config(_MLX_HF_MODEL)
         prompt = apply_chat_template(
-            _mlx_processor, config, OCR_PROMPT, num_images=1
+            _mlx_processor, config, prompt_text, num_images=1
         )
         result = generate(
             _mlx_model, _mlx_processor,
@@ -254,17 +301,22 @@ def _ocr_page_mlx_sync(b64: str) -> str:
     raw = result.text if hasattr(result, "text") else str(result)
     return _clean_ocr_output(raw)
 
-async def ocr_page_async(client: ollama.AsyncClient, b64: str, page_num: int, total: int) -> str:
-    """Single-page OCR via GLM-OCR (MLX on Apple Silicon, Ollama on NVIDIA/CPU)."""
+async def ocr_page_async(
+    client: ollama.AsyncClient,
+    b64: str, page_num: int, total: int,
+    task: str = TASK_VISUAL
+) -> str:
     async with _ocr_semaphore:
-        log(f"  OCR pagina {page_num}/{total} ({'MLX' if USE_MLX else 'Ollama'})...")
+        log(f"  OCR pag {page_num}/{total} [{task.upper()}] ({'MLX' if USE_MLX else 'Ollama'})...")
         if USE_MLX:
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(_MLX_EXECUTOR, _ocr_page_mlx_sync, b64)
+            return await loop.run_in_executor(
+                _MLX_EXECUTOR, _ocr_page_mlx_sync, b64, task
+            )
         else:
             resp = await client.generate(
                 model=MODEL_ID,
-                prompt=OCR_PROMPT,
+                prompt=TASK_PROMPTS.get(task, "Text Recognition:"),
                 images=[b64],
                 keep_alive=KEEP_ALIVE,
                 options={"num_ctx": NUM_CTX, "temperature": 0}
@@ -280,94 +332,106 @@ async def process_pdf(filepath: str):
     log(f"Elaborazione: {file_obj.name}")
 
     try:
-        info      = pdfinfo_from_path(filepath)
-        num_pages = info["Pages"]
+        ok, err = validate_pdf(filepath)
+        if not ok:
+            log(f"  SKIP {file_obj.name}: {err}")
+            shutil.move(filepath, ARCHIVE_DIR / file_obj.name)
+            return
 
-        # 1. Pre-classify all pages (fast PyMuPDF scan)
-        log(f"Pre-scansione {num_pages} pagine...")
+        num_pages = int(pdfinfo_from_path(filepath).get("Pages", 0))
+
+        log(f"Layout analysis: {num_pages} pagine...")
         classifications = classify_pages(filepath)
-        native_count = classifications.count("native")
-        vision_count = classifications.count("vision")
-        log(f"  Testo nativo: {native_count} pag | OCR vision: {vision_count} pag")
+        task_counts = {t: classifications.count(t) for t in [TASK_TEXT, TASK_FORMULA, TASK_TABLE, TASK_VISUAL]}
+        log(f"  text={task_counts[TASK_TEXT]} | formula={task_counts[TASK_FORMULA]} | table={task_counts[TASK_TABLE]} | visual={task_counts[TASK_VISUAL]}")
 
-        # ETA estimate (native ~instant, vision ~20s/pag)
-        if vision_count > 0:
-            est_sec = max(1, vision_count * 20 // OCR_CONCURRENCY)
-            est_str = f"~{est_sec//60}m {est_sec%60}s (parallel x{OCR_CONCURRENCY})" if est_sec>=60 else f"~{est_sec}s"
+        ocr_count = num_pages - task_counts[TASK_TEXT]
+        if ocr_count > 0:
+            est_sec = max(1, ocr_count * 20 // OCR_CONCURRENCY)
+            est_str = f"~{est_sec//60}m {est_sec%60}s" if est_sec >= 60 else f"~{est_sec}s"
         else:
             est_str = "< 1s (fast path)"
         send_notification(f"OCR: {file_obj.name}", f"{num_pages} pag | {est_str}")
 
-        # 2. Build Markdown via chunked lazy processing
-        client         = ollama.AsyncClient(host=OLLAMA_HOST)
-        full_markdown  = f"# {stem}\n\n"
-        t0             = time.time()
-        pages_done     = 0
-
-        # Assets folder for embedded images (Obsidian wiki-link syntax)
-        assets_dir = OUTPUT_DIR / "assets"
-        assets_dir.mkdir(parents=True, exist_ok=True)
+        client        = ollama.AsyncClient(host=OLLAMA_HOST)
+        full_markdown = f"# {stem}\n\n"
+        page_results  = []
+        t0            = time.time()
+        pages_done    = 0
 
         for chunk_start in range(0, num_pages, CHUNK_SIZE):
-            chunk_end    = min(chunk_start + CHUNK_SIZE, num_pages)
-            chunk_slice  = list(range(chunk_start, chunk_end))
-            chunk_class  = classifications[chunk_start:chunk_end]
+            chunk_end   = min(chunk_start + CHUNK_SIZE, num_pages)
+            chunk_slice = list(range(chunk_start, chunk_end))
 
-            vision_in_chunk = [i for i, c in zip(chunk_slice, chunk_class) if c == "vision"]
+            ocr_in_chunk = [i for i in chunk_slice if classifications[i] != TASK_TEXT]
 
-            # Lazy load images — one page at a time for vision pages ONLY.
-            # Loading a range (first_v..last_v) is wrong because it includes
-            # native-text pages in between, breaking the index mapping.
             page_images = {}
-            if vision_in_chunk:
-                for v_idx in vision_in_chunk:
-                    imgs = convert_from_path(filepath, dpi=DPI,
-                                             first_page=v_idx + 1,
-                                             last_page=v_idx + 1)
-                    page_images[v_idx] = imgs[0]  # exactly 1 page returned
+            for v_idx in ocr_in_chunk:
+                imgs = convert_from_path(filepath, dpi=DPI,
+                                         first_page=v_idx + 1,
+                                         last_page=v_idx + 1)
+                page_images[v_idx] = imgs[0]
 
-            # Build async tasks for vision pages in this chunk
-            vision_tasks = {
-                idx: ocr_page_async(client, page_to_b64(page_images[idx]),
-                                     idx + 1, num_pages)
-                for idx in vision_in_chunk
+            ocr_tasks = {
+                idx: ocr_page_async(
+                    client, page_to_b64(page_images[idx]),
+                    idx + 1, num_pages,
+                    task=classifications[idx]
+                )
+                for idx in ocr_in_chunk
             }
 
-            # Await all vision tasks concurrently (semaphore-bounded)
-            vision_results = {}
-            if vision_tasks:
-                results = await asyncio.gather(*vision_tasks.values())
-                vision_results = dict(zip(vision_tasks.keys(), results))
+            ocr_results = {}
+            if ocr_tasks:
+                results = await asyncio.gather(*ocr_tasks.values())
+                ocr_results = dict(zip(ocr_tasks.keys(), results))
 
-            # Assemble chunk output in page order
             for idx in chunk_slice:
-                if classifications[idx] == "native":
+                task = classifications[idx]
+                if task == TASK_TEXT:
                     text = extract_native_text_page(filepath, idx)
                 else:
-                    text = vision_results.get(idx, "")
-                if text.strip():
+                    text = ocr_results.get(idx, "")
+
+                extracted = bool(text.strip())
+                page_results.append({
+                    "page":      idx + 1,
+                    "task":      task,
+                    "chars":     len(text.strip()),
+                    "extracted": extracted,
+                })
+
+                if extracted:
                     full_markdown += text.strip() + "\n\n---\n\n"
-                elif classifications[idx] == "vision":
-                    pass  # GLM-OCR returned empty: purely visual page, skip silently
 
             pages_done += len(chunk_slice)
-            elapsed     = time.time() - t0
-            speed       = elapsed / pages_done if pages_done else 0
-            log(f"  Chunk {chunk_start+1}–{chunk_end}/{num_pages} | {speed:.2f}s/pag medio | RAM liberata")
+            elapsed = time.time() - t0
+            speed   = elapsed / pages_done if pages_done else 0
+            log(f"  Chunk {chunk_start+1}–{chunk_end}/{num_pages} | {speed:.2f}s/pag | RAM liberata")
 
-            # Release chunk images from memory
-            del page_images, vision_results
+            del page_images, ocr_results
             gc.collect()
 
-        # 3. Save Markdown
         elapsed = time.time() - t0
         speed   = elapsed / num_pages
         output_path = OUTPUT_DIR / f"{stem}.md"
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(full_markdown)
-        log(f"✓ Completato in {elapsed:.1f}s | Velocità media: {speed:.2f}s/pag | → {output_path}")
 
-        # 4. Archive original
+        json_path = OUTPUT_DIR / f"{stem}.json"
+        with open(json_path, "w", encoding="utf-8") as jf:
+            json.dump({
+                "file":             file_obj.name,
+                "pages":            num_pages,
+                "processing_time_s": round(elapsed, 2),
+                "speed_s_per_page": round(speed, 3),
+                "task_summary":     task_counts,
+                "layout_details":   page_results,
+            }, jf, ensure_ascii=False, indent=2)
+
+        log(f"✓ Completato in {elapsed:.1f}s | {speed:.2f}s/pag | → {output_path}")
+        log(f"  JSON layout: {json_path}")
+
         shutil.move(filepath, ARCHIVE_DIR / file_obj.name)
 
         _last_job_time = time.time()
