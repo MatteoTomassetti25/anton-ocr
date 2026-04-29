@@ -213,20 +213,31 @@ async def _unload_vram_async():
 # ─────────────────── TIERING LOGIC ───────────────────
 def classify_pages(filepath: str) -> list[str]:
     """
-    Multi-stage document layout analysis per page.
-    Routes each page to the correct GLM-OCR task:
-      'text'    → plain narrative text, fast PyMuPDF extraction
-      'formula' → math-dense page,   Formula Recognition:
-      'table'   → tabular data,       Table Recognition:
-      'visual'  → diagrams/figures,  Text Recognition: (best effort)
-    Priority: table > formula > text > visual
+    Document layout analysis per page — routes to the correct GLM-OCR task.
+
+    Priority (strict order):
+      1. TASK_TEXT    — sufficient native text extracted by PyMuPDF (always fast path).
+                        Formulas present as text chars are extracted natively — no MLX needed.
+      2. TASK_TABLE   — PyMuPDF detects a grid/table structure on a sparse page.
+      3. TASK_FORMULA — sparse page with math symbols (formula likely rendered as image).
+      4. TASK_VISUAL  — sparse page, no recognizable structure (diagram, figure, photo).
+
+    Key rule: native text ≥ TEXT_THRESHOLD → TASK_TEXT regardless of formula chars.
+    Formula routing only activates for pages where OCR is required (sparse native text).
     """
     doc = fitz.open(filepath)
     result = []
     for page in doc:
         text = page.get_text().strip()
 
-        # 1. Table detection via PyMuPDF structural analysis
+        # Priority 1: sufficient native text → always PyMuPDF fast path
+        # (formula characters in native PDF text are extracted correctly by PyMuPDF)
+        if len(text) >= TEXT_THRESHOLD:
+            result.append(TASK_TEXT)
+            continue
+
+        # Below threshold: page is sparse/image-based → needs GLM-OCR
+        # Priority 2: table structure detected
         has_table = False
         try:
             tabs = page.find_tables()
@@ -234,18 +245,18 @@ def classify_pages(filepath: str) -> list[str]:
         except Exception:
             pass
 
-        # 2. Formula detection via regex on extracted text
-        has_formula = bool(_FORMULA_RE.search(text)) if text else False
-
-        # 3. Routing decision (priority: table > formula > text > visual)
         if has_table:
             result.append(TASK_TABLE)
-        elif has_formula:
+            continue
+
+        # Priority 3: math symbols in sparse text → formula rendered as image
+        has_formula = bool(_FORMULA_RE.search(text)) if text else False
+        if has_formula:
             result.append(TASK_FORMULA)
-        elif len(text) >= TEXT_THRESHOLD:
-            result.append(TASK_TEXT)
-        else:
-            result.append(TASK_VISUAL)
+            continue
+
+        # Priority 4: truly sparse/visual page (diagram, figure)
+        result.append(TASK_VISUAL)
 
     doc.close()
     return result
