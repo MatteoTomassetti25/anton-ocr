@@ -188,24 +188,41 @@ def page_to_b64(page) -> str:
 
 # ─────────────────── ASYNC OCR ───────────────────────
 def _ocr_page_mlx_sync(b64: str) -> str:
-    """MLX native inference — runs in thread executor (MLX is not async)."""
-    import mlx.core as mx
+    """MLX native inference — runs in thread executor (MLX is not async).
+    mlx-vlm v0.4.x signature: generate(model, processor, prompt, image=path)
+    """
+    import tempfile, os as _os
     from mlx_vlm import generate
     from mlx_vlm.prompt_utils import apply_chat_template
-    from PIL import Image
-    import base64, io
+    from mlx_vlm.utils import load_config
+
     _load_mlx_model()  # Lazy load on first call
+
+    # mlx-vlm 0.4.x needs a file path for 'image', not a PIL object
     img_bytes = base64.b64decode(b64)
-    image = Image.open(io.BytesIO(img_bytes))
-    prompt = apply_chat_template(
-        _mlx_processor, _mlx_model.config,
-        "Text Recognition:", num_images=1
-    )
-    result = generate(
-        _mlx_model, _mlx_processor, image,
-        prompt=prompt, max_tokens=2048, verbose=False
-    )
-    return result
+    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    try:
+        tmp.write(img_bytes)
+        tmp.close()
+
+        config = load_config(_MLX_HF_MODEL)
+        prompt = apply_chat_template(
+            _mlx_processor, config,
+            "Text Recognition:", num_images=1
+        )
+        # v0.4.x: (model, processor, prompt, image=path)
+        result = generate(
+            _mlx_model, _mlx_processor,
+            prompt,
+            image=tmp.name,
+            max_tokens=2048,
+            verbose=False
+        )
+    finally:
+        _os.unlink(tmp.name)
+
+    # GenerationResult object — extract .text attribute if present
+    return result.text if hasattr(result, "text") else str(result)
 
 async def ocr_page_async(client: ollama.AsyncClient, b64: str, page_num: int, total: int) -> str:
     """Single-page OCR — MLX on Apple Silicon, Ollama on NVIDIA/CPU."""
