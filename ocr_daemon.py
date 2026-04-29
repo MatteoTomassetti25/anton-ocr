@@ -122,21 +122,40 @@ _COMPLEX_RE = re.compile(
 )
 
 # ─────────────────── OCR PROMPT ───────────────────────────
-# Structured extraction prompt for GLM-OCR.
-# Instructs the model to produce LaTeX/Markdown output
-# suitable for an AI knowledge base (Obsidian / RAG agent).
+# GLM-OCR is a specialized OCR model that responds to the
+# "Text Recognition:" trigger. Long instruction paragraphs cause
+# the model to echo the instructions back instead of extracting.
+# Keep prompt short, starting with the native trigger phrase.
 OCR_PROMPT = (
-    "Convert ALL content visible in this image to clean, structured Markdown. "
-    "Follow these rules strictly:\n"
-    "1. FORMULAS: render every mathematical formula or equation in LaTeX "
-    "(inline with $...$ or block with $$...$$). Never use plain text for math.\n"
-    "2. TABLES: convert every table to Markdown table syntax (| col | col | ...).\n"
-    "3. DIAGRAMS & GRAPHS: describe the diagram structure with bullet points. "
-    "List axis labels, curve names, key points and their coordinates. "
-    "For tree/graph structures, describe nodes and edges in a code block.\n"
-    "4. TEXT: preserve all text content exactly, maintaining heading hierarchy.\n"
-    "5. OUTPUT ONLY the Markdown content — no preamble, no commentary."
+    "Text Recognition: Extract ALL content from this image. "
+    "Rules: "
+    "(1) Mathematical formulas → LaTeX ($inline$ or $$block$$). "
+    "(2) Tables → Markdown table syntax. "
+    "(3) Diagrams/graphs → bullet list describing elements, axes, labels. "
+    "Output ONLY the extracted Markdown, no explanations."
 )
+
+# Phrases that indicate the model echoed the prompt back instead of
+# extracting content (happens on purely visual pages with no text).
+_PROMPT_ECHO_MARKERS = [
+    "Text Recognition: Extract",
+    "Rules: ",
+    "Mathematical formulas → LaTeX",
+    "Tables → Markdown",
+    "Diagrams/graphs → bullet",
+    "Output ONLY the extracted",
+]
+
+def _clean_ocr_output(raw: str) -> str:
+    """Strip markdown wrapper and detect prompt echo — return empty string if echo."""
+    # 1. Strip ```markdown ... ``` wrapper
+    text = re.sub(r'^```(?:markdown)?\n?', '', raw.strip(), flags=re.IGNORECASE)
+    text = re.sub(r'\n?```$', '', text.strip()).strip()
+    # 2. Anti-echo: if output contains our prompt keywords it's not real content
+    head = text[:300].lower()
+    if any(marker.lower() in head for marker in _PROMPT_ECHO_MARKERS):
+        return ""  # Treat as empty — fallback to image embed
+    return text
 
 def ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -245,13 +264,9 @@ def _ocr_page_mlx_sync(b64: str) -> str:
     finally:
         _os.unlink(tmp.name)
 
-    # Extract text from GenerationResult, strip markdown code-block wrapper
-    # mlx-vlm wraps output in ```markdown\n...\n``` even when content is empty
+    # Extract text from GenerationResult and clean output
     raw = result.text if hasattr(result, "text") else str(result)
-    # Remove ```markdown ... ``` or ``` ... ``` wrapper
-    stripped = re.sub(r'^```(?:markdown)?\n?', '', raw.strip(), flags=re.IGNORECASE)
-    stripped = re.sub(r'\n?```$', '', stripped.strip())
-    return stripped.strip()
+    return _clean_ocr_output(raw)
 
 async def ocr_page_async(client: ollama.AsyncClient, b64: str, page_num: int, total: int) -> str:
     """Single-page OCR — MLX on Apple Silicon (single thread), Ollama on NVIDIA/CPU."""
