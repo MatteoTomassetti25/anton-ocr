@@ -28,14 +28,15 @@ _mlx_processor = None
 _MLX_HF_MODEL = "mlx-community/GLM-OCR-8bit"  # 8-bit: best quality/VRAM ratio
 
 def _load_mlx_model():
-    """Lazily load MLX model on first use."""
+    """Lazily load MLX model on first use — thread-safe via lock."""
     global _mlx_model, _mlx_processor
-    if _mlx_model is not None:
-        return
-    from mlx_vlm import load
-    log(f"Caricamento MLX model: {_MLX_HF_MODEL} (primo avvio, attendi...)")
-    _mlx_model, _mlx_processor = load(_MLX_HF_MODEL)
-    log("MLX model caricato nel Neural Engine/GPU Metal.")
+    with _MLX_LOAD_LOCK:
+        if _mlx_model is not None:
+            return
+        from mlx_vlm import load
+        log(f"Caricamento MLX model: {_MLX_HF_MODEL} (primo avvio, attendi...)")
+        _mlx_model, _mlx_processor = load(_MLX_HF_MODEL)
+        log("MLX model caricato nel Neural Engine/GPU Metal.")
 
 def _unload_mlx_model():
     """Release MLX model from unified memory."""
@@ -106,6 +107,12 @@ _shutdown_event: asyncio.Event  = None
 _ocr_semaphore: asyncio.Semaphore = None
 _last_job_time: float           = None
 _model_loaded: bool             = False
+
+# MLX MUST run on a single dedicated thread — GPU Metal stream is per-thread in MLX.
+# max_workers=1 guarantees all MLX calls share the same stream → no stream conflicts.
+from concurrent.futures import ThreadPoolExecutor as _TPE
+_MLX_EXECUTOR  = _TPE(max_workers=1, thread_name_prefix="mlx_worker")
+_MLX_LOAD_LOCK = threading.Lock()  # Prevent concurrent lazy-loads
 
 # Math/table patterns that trigger vision OCR even on text-rich pages
 _COMPLEX_RE = re.compile(
@@ -225,13 +232,14 @@ def _ocr_page_mlx_sync(b64: str) -> str:
     return result.text if hasattr(result, "text") else str(result)
 
 async def ocr_page_async(client: ollama.AsyncClient, b64: str, page_num: int, total: int) -> str:
-    """Single-page OCR — MLX on Apple Silicon, Ollama on NVIDIA/CPU."""
+    """Single-page OCR — MLX on Apple Silicon (single thread), Ollama on NVIDIA/CPU."""
     async with _ocr_semaphore:
         log(f"  OCR pagina {page_num}/{total} ({'MLX' if USE_MLX else 'Ollama'})...")
         if USE_MLX:
-            # MLX is synchronous — run in thread pool to avoid blocking event loop
+            # Force all MLX calls onto the single dedicated thread (_MLX_EXECUTOR)
+            # This guarantees a consistent Metal GPU stream — MLX is NOT thread-safe
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, _ocr_page_mlx_sync, b64)
+            return await loop.run_in_executor(_MLX_EXECUTOR, _ocr_page_mlx_sync, b64)
         else:
             resp = await client.generate(
                 model=MODEL_ID,
