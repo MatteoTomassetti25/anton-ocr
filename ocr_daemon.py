@@ -168,6 +168,62 @@ def _clean_ocr_output(raw: str) -> str:
         return ""
     return text
 
+# ───────────────── NATIVE TEXT CLEANER ───────────────────────
+# Beamer/LaTeXiT PDFs inject XML blobs character-by-character in the text stream.
+# Each character is on its own line: '<\nl\na\nt\ne\nx\ni\nt...'
+# This regex matches the expanded tag (any whitespace between chars) and its content.
+_LATEXIT_EXPANDED_RE = re.compile(
+    r'<\s*l\s*a\s*t\s*e\s*x\s*i\s*t[\s\S]*?<\s*/\s*l\s*a\s*t\s*e\s*x\s*i\s*t\s*>',
+    re.IGNORECASE
+)
+# Compact latexit (normal single-line tag)
+_LATEXIT_COMPACT_RE = re.compile(
+    r'<latexit[^>]*>[\s\S]*?</latexit>',
+    re.IGNORECASE
+)
+# Long base64 blobs left behind when latexit tags are already stripped
+_B64_BLOB_RE = re.compile(
+    r'(?:^|(?<=\s))[A-Za-z0-9+/]{80,}={0,2}(?=\s|$)',
+    re.MULTILINE
+)
+# PDF math font encoding artifacts (Beamer presentations)
+# Pattern: (replacement) pairs applied in order.
+_MATH_NORM_STR = [
+    ('\u2712', '\u03b5'),      # ✒ (pencil) → ε (epsilon)
+    ('\u21e2', '\u03c1'),      # ⇢ → ρ (rho)
+    ('\u2318', '\u2261'),      # ⌘ (command) → ≡ (equiv)
+]
+_MATH_NORM_RE = [
+    # "2 C" / "2 A" / "2 [0,1]" — ∈ encoded as "2" in Beamer math fonts
+    # Pattern: word char / ) followed by " 2 " followed by uppercase / [ { \\
+    (re.compile(r'(?<=[\w\)]) 2 (?=[A-Z\[{\\])'), ' ∈ '),
+    # "! 0" / "! R" / "!0" — → encoded as "!" in math fonts
+    (re.compile(r'(\w)\s*!\s*([0-9A-Za-z∞])'), r'\1 → \2'),
+    # "kXk" or "kXk2" — norm ‖·‖ encoded as k...k in Beamer fonts
+    # Only match when X contains parentheses (math expression, not plain letter)
+    (re.compile(r'(?<!\w)k([^k\n]+(?:\([^)\n]*\))[^k\n]*?)k(\d?)(?!\w)'), r'‖\1‖\2'),
+]
+
+def _clean_native_text(text: str) -> str:
+    """Remove LaTeXiT garbage and normalize PDF math font encoding artifacts.
+    Applied to text extracted from native PDF pages (PyMuPDF).
+    """
+    # 1. Strip expanded latexit (character-by-character across newlines)
+    text = _LATEXIT_EXPANDED_RE.sub('', text)
+    # 2. Strip compact latexit
+    text = _LATEXIT_COMPACT_RE.sub('', text)
+    # 3. Strip leftover base64 blobs
+    text = _B64_BLOB_RE.sub('', text)
+    # 4. Normalize math symbols (string replacements)
+    for old, new in _MATH_NORM_STR:
+        text = text.replace(old, new)
+    # 5. Normalize math symbols (regex)
+    for pattern, replacement in _MATH_NORM_RE:
+        text = pattern.sub(replacement, text)
+    # 6. Collapse 3+ consecutive newlines to 2
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text
+
 def ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -276,11 +332,11 @@ def validate_pdf(filepath: str) -> tuple[bool, str]:
     return True, ""
 
 def extract_native_text_page(filepath: str, page_idx: int) -> str:
-    """Extract native text from a single page."""
-    doc = fitz.open(filepath)
+    """Extract native text from a single page with latexit/math normalization."""
+    doc  = fitz.open(filepath)
     text = doc[page_idx].get_text()
     doc.close()
-    return text
+    return _clean_native_text(text)
 
 # ─────────────────── IMAGE UTILITIES ─────────────────
 def page_to_b64(page) -> str:
