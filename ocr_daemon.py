@@ -121,6 +121,23 @@ _COMPLEX_RE = re.compile(
     r"\|.*?\|"                   # matrix/determinant notation
 )
 
+# ─────────────────── OCR PROMPT ───────────────────────────
+# Structured extraction prompt for GLM-OCR.
+# Instructs the model to produce LaTeX/Markdown output
+# suitable for an AI knowledge base (Obsidian / RAG agent).
+OCR_PROMPT = (
+    "Convert ALL content visible in this image to clean, structured Markdown. "
+    "Follow these rules strictly:\n"
+    "1. FORMULAS: render every mathematical formula or equation in LaTeX "
+    "(inline with $...$ or block with $$...$$). Never use plain text for math.\n"
+    "2. TABLES: convert every table to Markdown table syntax (| col | col | ...).\n"
+    "3. DIAGRAMS & GRAPHS: describe the diagram structure with bullet points. "
+    "List axis labels, curve names, key points and their coordinates. "
+    "For tree/graph structures, describe nodes and edges in a code block.\n"
+    "4. TEXT: preserve all text content exactly, maintaining heading hierarchy.\n"
+    "5. OUTPUT ONLY the Markdown content — no preamble, no commentary."
+)
+
 def ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -215,7 +232,7 @@ def _ocr_page_mlx_sync(b64: str) -> str:
         config = load_config(_MLX_HF_MODEL)
         prompt = apply_chat_template(
             _mlx_processor, config,
-            "Text Recognition:", num_images=1
+            OCR_PROMPT, num_images=1
         )
         # v0.4.x: (model, processor, prompt, image=path)
         result = generate(
@@ -248,7 +265,7 @@ async def ocr_page_async(client: ollama.AsyncClient, b64: str, page_num: int, to
         else:
             resp = await client.generate(
                 model=MODEL_ID,
-                prompt="Text Recognition:",
+                prompt=OCR_PROMPT,
                 images=[b64],
                 keep_alive=KEEP_ALIVE,
                 options={"num_ctx": NUM_CTX, "temperature": 0}
@@ -332,16 +349,15 @@ async def process_pdf(filepath: str):
                 if text.strip():
                     full_markdown += text.strip() + "\n\n---\n\n"
                 elif classifications[idx] == "vision":
-                    # No text extracted — save page as image and embed in Obsidian
+                    # Model returned nothing even with rich prompt — embed image as fallback
                     img = page_images.get(idx)
                     if img:
                         asset_name = f"{stem}_p{idx+1:03d}.jpg"
                         asset_path = assets_dir / asset_name
                         img.save(str(asset_path), format="JPEG", quality=90)
-                        # Obsidian wiki-link embed: ![[filename.jpg]]
                         full_markdown += f"![[{asset_name}]]\n\n---\n\n"
                     else:
-                        full_markdown += f"*[Pagina {idx+1}: immagine non disponibile]*\n\n---\n\n"
+                        full_markdown += f"*[Pagina {idx+1}: nessun contenuto estratto]*\n\n---\n\n"
 
             pages_done += len(chunk_slice)
             elapsed     = time.time() - t0
