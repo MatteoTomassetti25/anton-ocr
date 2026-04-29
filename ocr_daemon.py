@@ -288,6 +288,10 @@ async def process_pdf(filepath: str):
         t0             = time.time()
         pages_done     = 0
 
+        # Assets folder for embedded images (Obsidian wiki-link syntax)
+        assets_dir = OUTPUT_DIR / "assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+
         for chunk_start in range(0, num_pages, CHUNK_SIZE):
             chunk_end    = min(chunk_start + CHUNK_SIZE, num_pages)
             chunk_slice  = list(range(chunk_start, chunk_end))
@@ -328,8 +332,16 @@ async def process_pdf(filepath: str):
                 if text.strip():
                     full_markdown += text.strip() + "\n\n---\n\n"
                 elif classifications[idx] == "vision":
-                    # Page had only visual content (diagram/graph) — no text to extract
-                    full_markdown += f"*[Pagina {idx+1}: contenuto visuale — diagramma/immagine]*\n\n---\n\n"
+                    # No text extracted — save page as image and embed in Obsidian
+                    img = page_images.get(idx)
+                    if img:
+                        asset_name = f"{stem}_p{idx+1:03d}.jpg"
+                        asset_path = assets_dir / asset_name
+                        img.save(str(asset_path), format="JPEG", quality=90)
+                        # Obsidian wiki-link embed: ![[filename.jpg]]
+                        full_markdown += f"![[{asset_name}]]\n\n---\n\n"
+                    else:
+                        full_markdown += f"*[Pagina {idx+1}: immagine non disponibile]*\n\n---\n\n"
 
             pages_done += len(chunk_slice)
             elapsed     = time.time() - t0
