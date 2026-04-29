@@ -228,8 +228,13 @@ def _ocr_page_mlx_sync(b64: str) -> str:
     finally:
         _os.unlink(tmp.name)
 
-    # GenerationResult object — extract .text attribute if present
-    return result.text if hasattr(result, "text") else str(result)
+    # Extract text from GenerationResult, strip markdown code-block wrapper
+    # mlx-vlm wraps output in ```markdown\n...\n``` even when content is empty
+    raw = result.text if hasattr(result, "text") else str(result)
+    # Remove ```markdown ... ``` or ``` ... ``` wrapper
+    stripped = re.sub(r'^```(?:markdown)?\n?', '', raw.strip(), flags=re.IGNORECASE)
+    stripped = re.sub(r'\n?```$', '', stripped.strip())
+    return stripped.strip()
 
 async def ocr_page_async(client: ollama.AsyncClient, b64: str, page_num: int, total: int) -> str:
     """Single-page OCR — MLX on Apple Silicon (single thread), Ollama on NVIDIA/CPU."""
@@ -322,6 +327,9 @@ async def process_pdf(filepath: str):
                     text = vision_results.get(idx, "")
                 if text.strip():
                     full_markdown += text.strip() + "\n\n---\n\n"
+                elif classifications[idx] == "vision":
+                    # Page had only visual content (diagram/graph) — no text to extract
+                    full_markdown += f"*[Pagina {idx+1}: contenuto visuale — diagramma/immagine]*\n\n---\n\n"
 
             pages_done += len(chunk_slice)
             elapsed     = time.time() - t0
