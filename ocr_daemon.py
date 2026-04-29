@@ -321,14 +321,19 @@ async def process_pdf(filepath: str):
         _last_job_time = time.time()
         _model_loaded  = True
 
+        # Libera immediatamente la memoria (MLX unified memory o Ollama VRAM)
+        await _unload_vram_async()
+
         send_notification("OCR Completato ✓",
                           f"{stem}.md | {speed:.1f}s/pag | {elapsed:.0f}s totali")
 
     except asyncio.CancelledError:
         log(f"Elaborazione interrotta (shutdown): {file_obj.name}")
+        await _unload_vram_async()
         raise
     except Exception as e:
         log(f"ERRORE {file_obj.name}: {e}")
+        await _unload_vram_async()
         send_notification("Errore OCR ✗", f"{file_obj.name}: {str(e)[:80]}")
 
 # ─────────────────── QUEUE WORKER ────────────────────
