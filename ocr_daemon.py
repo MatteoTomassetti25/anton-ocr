@@ -121,42 +121,29 @@ _COMPLEX_RE = re.compile(
     r"\|.*?\|"                   # matrix/determinant notation
 )
 
-# ─────────────────── OCR PROMPTS ─────────────────────────
-# GLM-OCR responds to "Text Recognition:" as native trigger.
-# Keep short to avoid echo.
-OCR_PROMPT = (
-    "Text Recognition: Extract ALL content from this image. "
-    "Mathematical formulas → LaTeX ($inline$ / $$block$$). "
-    "Tables → Markdown table. "
-    "Output ONLY extracted Markdown."
-)
+# ─────────────────── OCR PROMPT ─────────────────────────
+# GLM-OCR responds ONLY to its native trigger "Text Recognition:".
+# Any additional instructions cause the model to echo them back
+# instead of extracting content. Keep it to the bare trigger only.
+OCR_PROMPT = "Text Recognition:"
 
-# Fallback prompt when OCR returns empty (purely visual pages).
-# GLM-4V (base of GLM-OCR) is a general VLM and can describe images.
-DESCRIPTION_PROMPT = (
-    "Describe in detail ALL visual content on this page in structured Markdown. "
-    "Include: mathematical/geometric diagrams with their labels and properties, "
-    "graph axes, curve shapes and notable points, arrow directions and meaning, "
-    "any mathematical notation in LaTeX ($$...$$). "
-    "Structure the output with bullet points and headers. "
-    "This text will be read by an AI agent — be thorough and precise."
-)
-
-# Markers that indicate the model echoed the prompt instead of extracting.
+# Phrases that mean the model returned garbage instead of extracted content.
 _PROMPT_ECHO_MARKERS = [
-    "Text Recognition: Extract",
-    "Mathematical formulas →",
-    "Tables → Markdown",
-    "Output ONLY extracted",
-    "Describe in detail ALL visual",
-    "This text will be read by an AI",
+    "text recognition:",
+    "mathematical formulas →",
+    "tables → markdown",
+    "output only extracted",
+    "describe in detail",
+    "parabola, hyperbola, ellipse",
+    "graph axes: x-axis, y-axis",
+    "<|begin_of_image|>",
 ]
 
 def _clean_ocr_output(raw: str) -> str:
-    """Strip markdown wrapper and detect prompt echo — return empty string if echo."""
+    """Strip markdown wrapper and discard garbage/echo output."""
     text = re.sub(r'^```(?:markdown)?\n?', '', raw.strip(), flags=re.IGNORECASE)
     text = re.sub(r'\n?```$', '', text.strip()).strip()
-    head = text[:300].lower()
+    head = text[:400].lower()
     if any(marker.lower() in head for marker in _PROMPT_ECHO_MARKERS):
         return ""
     return text
@@ -235,9 +222,9 @@ def page_to_b64(page) -> str:
 
 # ─────────────────── ASYNC OCR ───────────────────────
 def _ocr_page_mlx_sync(b64: str) -> str:
-    """MLX native inference with two-pass strategy:
-    Pass 1: OCR extraction (text/formulas/tables)
-    Pass 2: Visual description if OCR returns empty (diagrams/graphs)
+    """MLX native inference — single-pass OCR (text, formulas, tables).
+    GLM-OCR is NOT a captioning VLM: do not attempt image description,
+    it produces hallucinated generic content.
     mlx-vlm v0.4.x signature: generate(model, processor, prompt, image=path)
     """
     import tempfile, os as _os
@@ -245,7 +232,7 @@ def _ocr_page_mlx_sync(b64: str) -> str:
     from mlx_vlm.prompt_utils import apply_chat_template
     from mlx_vlm.utils import load_config
 
-    _load_mlx_model()  # Lazy load on first call
+    _load_mlx_model()
 
     img_bytes = base64.b64decode(b64)
     tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
@@ -253,30 +240,19 @@ def _ocr_page_mlx_sync(b64: str) -> str:
         tmp.write(img_bytes)
         tmp.close()
         config = load_config(_MLX_HF_MODEL)
-
-        def _run(prompt_text: str) -> str:
-            prompt = apply_chat_template(
-                _mlx_processor, config, prompt_text, num_images=1
-            )
-            res = generate(
-                _mlx_model, _mlx_processor,
-                prompt, image=tmp.name,
-                max_tokens=2048, verbose=False
-            )
-            raw = res.text if hasattr(res, "text") else str(res)
-            return _clean_ocr_output(raw)
-
-        # Pass 1: OCR (text, formulas, tables)
-        text = _run(OCR_PROMPT)
-
-        # Pass 2: Visual description if OCR found nothing
-        if not text.strip():
-            text = _run(DESCRIPTION_PROMPT)
-
+        prompt = apply_chat_template(
+            _mlx_processor, config, OCR_PROMPT, num_images=1
+        )
+        result = generate(
+            _mlx_model, _mlx_processor,
+            prompt, image=tmp.name,
+            max_tokens=2048, verbose=False
+        )
     finally:
         _os.unlink(tmp.name)
 
-    return text
+    raw = result.text if hasattr(result, "text") else str(result)
+    return _clean_ocr_output(raw)
 
 async def ocr_page_async(client: ollama.AsyncClient, b64: str, page_num: int, total: int) -> str:
     """Single-page OCR — MLX on Apple Silicon (single thread), Ollama on NVIDIA/CPU."""
@@ -374,9 +350,13 @@ async def process_pdf(filepath: str):
                 if text.strip():
                     full_markdown += text.strip() + "\n\n---\n\n"
                 elif classifications[idx] == "vision":
-                    # Both OCR and description pass returned empty
-                    # (truly blank page or model failure) — skip silently
-                    log(f"  WARN: pagina {idx+1} non ha prodotto testo (pagina visiva vuota?)")
+                    # GLM-OCR returned empty: purely visual page (diagram/graph)
+                    # with no extractable text. Clean callout for AI agent context.
+                    full_markdown += (
+                        f"> [!NOTE] Slide grafica (pag. {idx+1})\n"
+                        f"> Pagina con contenuto visivo non estraibile (diagramma/grafico/immagine).\n"
+                        f"\n---\n\n"
+                    )
 
             pages_done += len(chunk_slice)
             elapsed     = time.time() - t0
