@@ -1,35 +1,40 @@
-import os
-import sys
-import time
-import queue
-import base64
-import shutil
-import subprocess
+#!/usr/bin/env python3
+"""
+Anton OCR Daemon v3
+High-performance async pipeline:
+  - asyncio.gather + Semaphore(3) for concurrent OCR
+  - Per-page intelligent tiering (native text vs glm-ocr vision)
+  - Lazy chunked image loading (CHUNK_SIZE pages at a time)
+  - Hardware-aware: Apple Silicon (keep_alive=-1) vs NVIDIA/CPU
+  - Idle VRAM unload after 5 min of inactivity
+  - Graceful shutdown (completes current page before stopping)
+"""
+
+import asyncio
+import os, sys, time, gc, re, platform, shutil, subprocess, base64, io
 import threading
-import io
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from pdf2image import convert_from_path, pdfinfo_from_path
-import ollama
+import fitz          # PyMuPDF — fast page-level analysis
+import ollama        # AsyncClient for concurrent calls
 import requests as req
-import pymupdf4llm
-import fitz  # PyMuPDF
 
-# ---------------- CONFIGURATION ----------------
+# ─────────────────── CONFIGURATION ───────────────────
 def load_config():
-    config = {
-        "INPUT_DIR":     str(Path(__file__).parent / "input"),
-        "OUTPUT_DIR":    "/Users/cmdhro/Matteo/wikiAnton/Università",
-        "ARCHIVE_DIR":   str(Path(__file__).parent / "elaborati"),
-        "MODEL":         "glm-ocr:latest",
-        "DPI":           "200",
-        "NUM_CTX":       "16384",
-        "OLLAMA_HOST":   "http://localhost:11434",
-        "SECS_PER_PAGE": "22",
-        # Minimum text chars per page to consider it "native text"
+    cfg = {
+        "INPUT_DIR":      str(Path(__file__).parent / "input"),
+        "OUTPUT_DIR":     "/Users/cmdhro/Matteo/wikiAnton/Università",
+        "ARCHIVE_DIR":    str(Path(__file__).parent / "elaborati"),
+        "MODEL":          "glm-ocr:latest",
+        "DPI":            "150",
+        "NUM_CTX":        "16384",
+        "OLLAMA_HOST":    "http://localhost:11434",
         "TEXT_THRESHOLD": "50",
+        "CHUNK_SIZE":     "10",
+        "OCR_CONCURRENCY":"3",
+        "IDLE_VRAM_TIMEOUT": "300",
     }
     config_path = Path(__file__).parent / "config.env"
     if config_path.exists():
@@ -38,24 +43,50 @@ def load_config():
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
-                    config[k.strip()] = v.strip().replace("~", str(Path.home()))
-    return config
+                    cfg[k.strip()] = v.strip().replace("~", str(Path.home()))
+    return cfg
 
-CFG = load_config()
-INPUT_DIR      = Path(CFG["INPUT_DIR"])
-OUTPUT_DIR     = Path(CFG["OUTPUT_DIR"])
-ARCHIVE_DIR    = Path(CFG["ARCHIVE_DIR"])
-MODEL_ID       = CFG["MODEL"]
-DPI            = int(CFG["DPI"])
-NUM_CTX        = int(CFG["NUM_CTX"])
-OLLAMA_HOST    = CFG["OLLAMA_HOST"]
-SECS_PER_PAGE  = int(CFG["SECS_PER_PAGE"])
-TEXT_THRESHOLD = int(CFG.get("TEXT_THRESHOLD", "50"))
+CFG             = load_config()
+INPUT_DIR       = Path(CFG["INPUT_DIR"])
+OUTPUT_DIR      = Path(CFG["OUTPUT_DIR"])
+ARCHIVE_DIR     = Path(CFG["ARCHIVE_DIR"])
+MODEL_ID        = CFG["MODEL"]
+DPI             = int(CFG["DPI"])
+NUM_CTX         = int(CFG["NUM_CTX"])
+OLLAMA_HOST     = CFG["OLLAMA_HOST"]
+TEXT_THRESHOLD  = int(CFG["TEXT_THRESHOLD"])
+CHUNK_SIZE      = int(CFG["CHUNK_SIZE"])
+OCR_CONCURRENCY = int(CFG["OCR_CONCURRENCY"])
+IDLE_VRAM_TIMEOUT = int(CFG["IDLE_VRAM_TIMEOUT"])
 
-# Thread-safe queue + stop event
-pdf_queue: queue.Queue = queue.Queue()
-stop_event = threading.Event()
-# -----------------------------------------------
+# ─────────────────── HARDWARE DETECTION ───────────────
+IS_APPLE_SILICON = platform.machine() == "arm64" and sys.platform == "darwin"
+IS_NVIDIA = False
+try:
+    IS_NVIDIA = subprocess.run(
+        ["nvidia-smi"], capture_output=True, timeout=3
+    ).returncode == 0
+except Exception:
+    pass
+
+# Apple Silicon: keep model in VRAM indefinitely between files (-1 = forever)
+# Other hardware: keep 5 min after last use
+KEEP_ALIVE = -1 if IS_APPLE_SILICON else 300
+
+# ─────────────────── GLOBALS ──────────────────────────
+_loop: asyncio.AbstractEventLoop = None
+_pdf_queue: asyncio.Queue       = None
+_shutdown_event: asyncio.Event  = None
+_ocr_semaphore: asyncio.Semaphore = None
+_last_job_time: float           = None
+_model_loaded: bool             = False
+
+# Math/table patterns that trigger vision OCR even on text-rich pages
+_COMPLEX_RE = re.compile(
+    r"[∫∑∂∇∈∉≤≥≠±∞∀∃√∆]|"      # math symbols
+    r"\\frac|\\int|\\sum|"       # LaTeX fragments
+    r"\|.*?\|"                   # matrix/determinant notation
+)
 
 def ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -63,212 +94,299 @@ def ts() -> str:
 def log(msg: str):
     print(f"[{ts()}] {msg}", flush=True)
 
-def send_notification(title: str, message: str):
+# ─────────────────── NOTIFICATIONS ───────────────────
+def send_notification(title: str, msg: str):
     try:
         if sys.platform == "darwin":
-            script = f'display notification "{message}" with title "{title}"'
-            subprocess.run(["osascript", "-e", script], check=False)
+            subprocess.run(
+                ["osascript", "-e", f'display notification "{msg}" with title "{title}"'],
+                check=False
+            )
     except Exception:
         pass
 
-def unload_ollama_model():
-    """Free VRAM immediately via keep_alive=0."""
+# ─────────────────── VRAM MANAGEMENT ─────────────────
+def _unload_vram_sync():
+    """Synchronous VRAM unload via REST API."""
     try:
-        req.post(f"{OLLAMA_HOST}/api/generate",
-                 json={"model": MODEL_ID, "keep_alive": 0}, timeout=10)
-        log(f"VRAM deallocata: {MODEL_ID} scaricato.")
+        req.post(
+            f"{OLLAMA_HOST}/api/generate",
+            json={"model": MODEL_ID, "keep_alive": 0},
+            timeout=10
+        )
+        log(f"VRAM liberata: {MODEL_ID} scaricato.")
     except Exception as e:
-        log(f"WARN: impossibile deallocare VRAM: {e}")
+        log(f"WARN: impossibile liberare VRAM: {e}")
 
-def init_directories():
-    for d in [INPUT_DIR, OUTPUT_DIR, ARCHIVE_DIR]:
-        d.mkdir(parents=True, exist_ok=True)
+async def _unload_vram_async():
+    global _model_loaded
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _unload_vram_sync)
+    _model_loaded = False
 
-def wait_for_file_ready(filepath: str, timeout: int = 30) -> bool:
-    start = time.time()
-    last_size = -1
-    while time.time() - start < timeout:
-        if not os.path.exists(filepath):
-            return False
-        size = os.path.getsize(filepath)
-        if size == last_size and size > 0:
-            return True
-        last_size = size
-        time.sleep(1)
-    return False
-
-# ---- OCR Strategy Detection ----
-def is_text_based_pdf(filepath: str) -> bool:
+# ─────────────────── TIERING LOGIC ───────────────────
+def classify_pages(filepath: str) -> list[str]:
     """
-    Returns True if the PDF has enough native text to use pymupdf4llm (fast path).
-    Falls back to glm-ocr (slow path) for scanned/image-only PDFs.
+    Pre-scan all pages with PyMuPDF (fast, low-RAM).
+    Returns a list with "native" or "vision" per page.
     """
-    try:
-        doc = fitz.open(filepath)
-        total_chars = sum(len(page.get_text()) for page in doc)
-        doc.close()
-        avg_chars_per_page = total_chars / max(doc.page_count, 1)
-        return avg_chars_per_page >= TEXT_THRESHOLD
-    except Exception:
-        return False
+    doc = fitz.open(filepath)
+    result = []
+    for page in doc:
+        text = page.get_text()
+        if len(text.strip()) >= TEXT_THRESHOLD and not _COMPLEX_RE.search(text):
+            result.append("native")
+        else:
+            result.append("vision")
+    doc.close()
+    return result
 
-# ---- Fast Path: pymupdf4llm ----
-def process_pdf_fast(filepath: str, filename_stem: str) -> str:
-    """Extract text from native PDF using pymupdf4llm. ~0.05s/page."""
-    log("Rilevato PDF testuale → modalità FAST (pymupdf4llm)")
-    markdown = pymupdf4llm.to_markdown(filepath)
-    return markdown
+def extract_native_text_page(filepath: str, page_idx: int) -> str:
+    """Extract native text from a single page."""
+    doc = fitz.open(filepath)
+    text = doc[page_idx].get_text()
+    doc.close()
+    return text
 
-# ---- Slow Path: glm-ocr via Ollama ----
-def page_to_base64(page) -> str:
+# ─────────────────── IMAGE UTILITIES ─────────────────
+def page_to_b64(page) -> str:
     buf = io.BytesIO()
-    page.save(buf, format="JPEG", quality=90)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
+    page.save(buf, format="JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode()
 
-def call_glm_ocr(b64_image: str) -> str:
-    response = ollama.generate(
-        model=MODEL_ID,
-        prompt="Text Recognition:",
-        images=[b64_image],
-        options={"num_ctx": NUM_CTX, "temperature": 0}
-    )
-    return response["response"]
+# ─────────────────── ASYNC OCR ───────────────────────
+async def ocr_page_async(client: ollama.AsyncClient, b64: str, page_num: int, total: int) -> str:
+    """Single-page OCR call, rate-limited by semaphore."""
+    async with _ocr_semaphore:
+        log(f"  OCR pagina {page_num}/{total}...")
+        resp = await client.generate(
+            model=MODEL_ID,
+            prompt="Text Recognition:",
+            images=[b64],
+            keep_alive=KEEP_ALIVE,
+            options={"num_ctx": NUM_CTX, "temperature": 0}
+        )
+        return resp.response
 
-def process_pdf_ocr(filepath: str, num_pages: int) -> str:
-    """Process image-based PDF with glm-ocr. ~20s/page."""
-    log("Rilevato PDF con immagini → modalità OCR (glm-ocr)")
-    pages = convert_from_path(filepath, dpi=DPI)
+# ─────────────────── PDF PROCESSOR ───────────────────
+async def process_pdf(filepath: str):
+    global _last_job_time, _model_loaded
 
-    # Pre-encode pages to base64 concurrently
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        b64_list = list(ex.map(page_to_base64, pages))
-
-    full_markdown = ""
-    for i, b64 in enumerate(b64_list):
-        log(f"OCR pagina {i+1}/{num_pages}...")
-        text = call_glm_ocr(b64)
-        if text.strip():
-            full_markdown += text.strip() + "\n\n---\n\n"
-
-    unload_ollama_model()
-    return full_markdown
-
-# ---- Main Processing ----
-def process_pdf(filepath: str):
-    file_path_obj = Path(filepath)
-    filename_stem = file_path_obj.stem
-    log(f"Inizio elaborazione: {file_path_obj.name}")
+    file_obj = Path(filepath)
+    stem     = file_obj.stem
+    log(f"Elaborazione: {file_obj.name}")
 
     try:
-        info = pdfinfo_from_path(filepath)
+        info      = pdfinfo_from_path(filepath)
         num_pages = info["Pages"]
 
-        # Choose strategy
-        if is_text_based_pdf(filepath):
-            # FAST PATH — native text
-            est_str = f"< 1s (modalità fast)"
-            send_notification(
-                f"OCR Avviato: {file_path_obj.name}",
-                f"{num_pages} pagine · {est_str}"
-            )
-            t0 = time.time()
-            markdown = process_pdf_fast(filepath, filename_stem)
-            elapsed = time.time() - t0
-            log(f"Conversione completata in {elapsed:.2f}s ({elapsed/num_pages:.3f}s/pagina)")
+        # 1. Pre-classify all pages (fast PyMuPDF scan)
+        log(f"Pre-scansione {num_pages} pagine...")
+        classifications = classify_pages(filepath)
+        native_count = classifications.count("native")
+        vision_count = classifications.count("vision")
+        log(f"  Testo nativo: {native_count} pag | OCR vision: {vision_count} pag")
+
+        # ETA estimate (native ~instant, vision ~20s/pag)
+        if vision_count > 0:
+            est_sec = max(1, vision_count * 20 // OCR_CONCURRENCY)
+            est_str = f"~{est_sec//60}m {est_sec%60}s (parallel x{OCR_CONCURRENCY})" if est_sec>=60 else f"~{est_sec}s"
         else:
-            # SLOW PATH — glm-ocr vision model
-            est_sec = num_pages * SECS_PER_PAGE
-            est_str = f"{est_sec // 60}m {est_sec % 60}s (modalità OCR)"
-            send_notification(
-                f"OCR Avviato: {file_path_obj.name}",
-                f"{num_pages} pagine · Stima: {est_str}"
-            )
-            t0 = time.time()
-            markdown = process_pdf_ocr(filepath, num_pages)
-            elapsed = time.time() - t0
-            log(f"OCR completato in {elapsed:.2f}s ({elapsed/num_pages:.1f}s/pagina)")
+            est_str = "< 1s (fast path)"
+        send_notification(f"OCR: {file_obj.name}", f"{num_pages} pag | {est_str}")
 
-        # Save Markdown
-        output_path = OUTPUT_DIR / f"{filename_stem}.md"
+        # 2. Build Markdown via chunked lazy processing
+        client         = ollama.AsyncClient(host=OLLAMA_HOST)
+        full_markdown  = f"# {stem}\n\n"
+        t0             = time.time()
+        pages_done     = 0
+
+        for chunk_start in range(0, num_pages, CHUNK_SIZE):
+            chunk_end    = min(chunk_start + CHUNK_SIZE, num_pages)
+            chunk_slice  = list(range(chunk_start, chunk_end))
+            chunk_class  = classifications[chunk_start:chunk_end]
+
+            vision_in_chunk = [i for i, c in zip(chunk_slice, chunk_class) if c == "vision"]
+
+            # Lazy load images only for pages that need vision OCR
+            page_images = {}
+            if vision_in_chunk:
+                first_v = vision_in_chunk[0] + 1
+                last_v  = vision_in_chunk[-1] + 1
+                imgs = convert_from_path(filepath, dpi=DPI,
+                                         first_page=first_v, last_page=last_v)
+                for rel_i, img in enumerate(imgs):
+                    abs_i = vision_in_chunk[rel_i]
+                    page_images[abs_i] = img
+
+            # Build async tasks for vision pages in this chunk
+            vision_tasks = {
+                idx: ocr_page_async(client, page_to_b64(page_images[idx]),
+                                     idx + 1, num_pages)
+                for idx in vision_in_chunk
+            }
+
+            # Await all vision tasks concurrently (semaphore-bounded)
+            vision_results = {}
+            if vision_tasks:
+                results = await asyncio.gather(*vision_tasks.values())
+                vision_results = dict(zip(vision_tasks.keys(), results))
+
+            # Assemble chunk output in page order
+            for idx in chunk_slice:
+                if classifications[idx] == "native":
+                    text = extract_native_text_page(filepath, idx)
+                else:
+                    text = vision_results.get(idx, "")
+                if text.strip():
+                    full_markdown += text.strip() + "\n\n---\n\n"
+
+            pages_done += len(chunk_slice)
+            elapsed     = time.time() - t0
+            speed       = elapsed / pages_done if pages_done else 0
+            log(f"  Chunk {chunk_start+1}–{chunk_end}/{num_pages} | {speed:.2f}s/pag medio | RAM liberata")
+
+            # Release chunk images from memory
+            del page_images, vision_results
+            gc.collect()
+
+        # 3. Save Markdown
+        elapsed = time.time() - t0
+        speed   = elapsed / num_pages
+        output_path = OUTPUT_DIR / f"{stem}.md"
         with open(output_path, "w", encoding="utf-8") as f:
-            f.write(f"# {filename_stem}\n\n")
-            f.write(markdown)
-        log(f"Markdown salvato: {output_path}")
+            f.write(full_markdown)
+        log(f"✓ Completato in {elapsed:.1f}s | Velocità media: {speed:.2f}s/pag | → {output_path}")
 
-        # Archive original
-        shutil.move(filepath, ARCHIVE_DIR / file_path_obj.name)
-        log("File archiviato.")
+        # 4. Archive original
+        shutil.move(filepath, ARCHIVE_DIR / file_obj.name)
 
-        send_notification("OCR Completato ✓", f"{filename_stem}.md salvato")
+        _last_job_time = time.time()
+        _model_loaded  = True
 
+        send_notification("OCR Completato ✓",
+                          f"{stem}.md | {speed:.1f}s/pag | {elapsed:.0f}s totali")
+
+    except asyncio.CancelledError:
+        log(f"Elaborazione interrotta (shutdown): {file_obj.name}")
+        raise
     except Exception as e:
-        log(f"ERRORE su {file_path_obj.name}: {e}")
-        send_notification("Errore OCR ✗", f"{file_path_obj.name}: {str(e)[:80]}")
+        log(f"ERRORE {file_obj.name}: {e}")
+        send_notification("Errore OCR ✗", f"{file_obj.name}: {str(e)[:80]}")
 
-
-# ---- Queue Worker ----
-def queue_worker():
+# ─────────────────── QUEUE WORKER ────────────────────
+async def queue_worker():
     log("Queue worker avviato.")
-    while not stop_event.is_set():
+    while not _shutdown_event.is_set():
         try:
-            filepath = pdf_queue.get(timeout=1)
-            if filepath is None:
-                break
-            process_pdf(filepath)
-            pdf_queue.task_done()
-        except queue.Empty:
+            filepath = await asyncio.wait_for(_pdf_queue.get(), timeout=1.0)
+        except asyncio.TimeoutError:
             continue
-    log("Queue worker terminato.")
+        try:
+            await process_pdf(filepath)
+        finally:
+            _pdf_queue.task_done()
+    log("Queue worker terminato (graceful shutdown completato).")
 
+# ─────────────────── IDLE VRAM MONITOR ───────────────
+async def idle_vram_monitor():
+    """Unload model from VRAM after IDLE_VRAM_TIMEOUT seconds of inactivity."""
+    global _model_loaded
+    log(f"Idle VRAM monitor avviato (timeout: {IDLE_VRAM_TIMEOUT}s).")
+    while not _shutdown_event.is_set():
+        await asyncio.sleep(60)
+        if _model_loaded and _last_job_time:
+            idle = time.time() - _last_job_time
+            if idle >= IDLE_VRAM_TIMEOUT and _pdf_queue.empty():
+                log(f"Idle da {idle:.0f}s → VRAM unload...")
+                await _unload_vram_async()
 
-# ---- Watchdog Handler ----
+# ─────────────────── WATCHDOG ─────────────────────────
 class PDFHandler(FileSystemEventHandler):
+    def __init__(self, loop):
+        self._loop = loop
+
     def on_created(self, event):
         if event.is_directory or not event.src_path.lower().endswith(".pdf"):
             return
         time.sleep(1)
-        if wait_for_file_ready(event.src_path):
-            q_size = pdf_queue.qsize()
-            name = Path(event.src_path).name
-            log(f"PDF rilevato: {name} · Coda: {q_size + 1} doc")
-            if q_size > 0:
-                send_notification(f"PDF in coda: {name}", f"{q_size + 1} documenti in attesa")
-            pdf_queue.put(event.src_path)
-        else:
-            log(f"Timeout attesa file: {event.src_path}")
+        path = event.src_path
+        if not _wait_for_file(path):
+            log(f"Timeout attesa file: {path}")
+            return
+        q_size = _pdf_queue.qsize()
+        name   = Path(path).name
+        log(f"PDF rilevato: {name} | Coda: {q_size + 1} doc")
+        if q_size > 0:
+            send_notification(f"PDF in coda: {name}", f"{q_size + 1} in attesa")
+        # Bridge thread → asyncio event loop
+        self._loop.call_soon_threadsafe(_pdf_queue.put_nowait, path)
 
+def _wait_for_file(filepath: str, timeout: int = 30) -> bool:
+    start = time.time()
+    last  = -1
+    while time.time() - start < timeout:
+        if not os.path.exists(filepath):
+            return False
+        sz = os.path.getsize(filepath)
+        if sz == last and sz > 0:
+            return True
+        last = sz
+        time.sleep(1)
+    return False
 
-# ---- Main ----
-def start_daemon():
-    init_directories()
-    log("Anton OCR Daemon v2 - Online")
-    log(f"Modello OCR : {MODEL_ID} (num_ctx={NUM_CTX})")
-    log(f"Fast path   : pymupdf4llm (PDF testuali, soglia {TEXT_THRESHOLD} chars/pagina)")
+# ─────────────────── MAIN ─────────────────────────────
+async def amain():
+    global _pdf_queue, _shutdown_event, _ocr_semaphore
+
+    _pdf_queue      = asyncio.Queue()
+    _shutdown_event = asyncio.Event()
+    _ocr_semaphore  = asyncio.Semaphore(OCR_CONCURRENCY)
+
+    for d in [INPUT_DIR, OUTPUT_DIR, ARCHIVE_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    hw = "Apple Silicon (MPS)" if IS_APPLE_SILICON else ("NVIDIA GPU" if IS_NVIDIA else "CPU")
+    log(f"Anton OCR Daemon v3 — Online")
+    log(f"Hardware    : {hw} | keep_alive={KEEP_ALIVE}s")
+    log(f"Modello OCR : {MODEL_ID} | concurrency={OCR_CONCURRENCY} | chunk={CHUNK_SIZE} pag | DPI={DPI}")
+    log(f"Tiering     : testo nativo (≥{TEXT_THRESHOLD} chars/pag) → fast | sparse → glm-ocr")
+    log(f"VRAM idle   : unload dopo {IDLE_VRAM_TIMEOUT}s di inattività")
     log(f"Input       : {INPUT_DIR}")
     log(f"Output      : {OUTPUT_DIR}")
-    log(f"Archivio    : {ARCHIVE_DIR}")
 
-    worker = threading.Thread(target=queue_worker, daemon=True)
-    worker.start()
-
-    event_handler = PDFHandler()
+    loop = asyncio.get_running_loop()
+    handler  = PDFHandler(loop)
     observer = Observer()
-    observer.schedule(event_handler, str(INPUT_DIR), recursive=False)
+    observer.schedule(handler, str(INPUT_DIR), recursive=False)
     observer.start()
 
+    tasks = [
+        asyncio.create_task(queue_worker(), name="queue_worker"),
+        asyncio.create_task(idle_vram_monitor(), name="idle_vram"),
+    ]
+
     try:
-        while not stop_event.is_set():
-            time.sleep(1)
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        log("Shutdown: attendo completamento job corrente...")
+        _shutdown_event.set()
+        # Graceful: wait for queue to drain (current page finishes)
+        await asyncio.wait_for(_pdf_queue.join(), timeout=300)
+        observer.stop()
+        observer.join()
+        # Unload VRAM on stop
+        if _model_loaded:
+            await _unload_vram_async()
+        log("Daemon terminato correttamente.")
+
+def start_daemon():
+    try:
+        asyncio.run(amain())
     except KeyboardInterrupt:
         pass
-
-    log("Shutdown ricevuto. Arresto in corso...")
-    stop_event.set()
-    observer.stop()
-    pdf_queue.put(None)
-    worker.join(timeout=5)
-    observer.join()
-    log("Daemon arrestato.")
 
 if __name__ == "__main__":
     start_daemon()
