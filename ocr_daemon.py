@@ -145,6 +145,20 @@ MAX_PDF_MB    = 50
 MAX_IMG_MB    = 10
 MAX_PDF_PAGES = 100
 
+# Phrases that mean the model returned its prompt back instead of content.
+_PROMPT_ECHO_MARKERS = [
+    "text recognition:",
+    "formula recognition:",
+    "table recognition:",
+    "mathematical formulas →",
+    "tables → markdown",
+    "output only extracted",
+    "describe in detail",
+    "parabola, hyperbola, ellipse",
+    "graph axes: x-axis, y-axis",
+    "<|begin_of_image|>",
+]
+
 def _clean_ocr_output(raw: str) -> str:
     """Strip markdown wrapper and discard garbage/echo output."""
     text = re.sub(r'^```(?:markdown)?\n?', '', raw.strip(), flags=re.IGNORECASE)
