@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anton-ocr"
+version = "4.0.0"
+description = "Local-first document ingestion with automatic pseudonymisation and a signed audit trail."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Matteo Tomassetti", email = "matteotomassetti25@gmail.com" }]
+keywords = ["ocr", "pii", "gdpr", "ai-act", "privacy", "local-first", "pseudonymisation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Text Processing",
+]
+
+# Il nucleo privacy non dipende da nulla di pesante e non tocca la rete.
+dependencies = [
+    "cryptography>=42",
+    "PyYAML>=6",
+]
+
+[project.optional-dependencies]
+# Estrazione PDF con licenza permissiva (default)
+pdf = ["pypdfium2>=4"]
+# Rilevamento tabelle e analisi layout avanzata.
+# ATTENZIONE: PyMuPDF è AGPL-3.0. Installalo solo se la tua distribuzione lo consente.
+pymupdf = ["PyMuPDF>=1.24"]
+# Backend OCR
+ollama = ["ollama>=0.3", "pdf2image>=1.17", "Pillow>=10", "requests>=2"]
+mlx = ["mlx-vlm>=0.4", "pdf2image>=1.17", "Pillow>=10"]
+# Riconoscimento entità nominate (modello locale, scaricato una volta)
+ner = ["gliner>=0.2"]
+# Backend PII alternativo
+presidio = ["presidio-analyzer>=2.2", "presidio-anonymizer>=2.2"]
+# Daemon con watchfolder
+daemon = ["watchdog>=4"]
+# Chiave del vault nel portachiavi di sistema
+keyring = ["keyring>=24"]
+dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.6"]
+
+[project.scripts]
+anton-ocr = "anton_ocr.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/MatteoTomassetti25/anton-ocr"
+Issues = "https://github.com/MatteoTomassetti25/anton-ocr/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    # I test della GUI avviano un server su 127.0.0.1 e quindi richiedono
+    # l'interfaccia di loopback attiva. Nel job CI zero-egress (`unshare -rn`)
+    # non esiste alcuna interfaccia, nemmeno lo: quei test vanno esclusi.
+    # Non è un'eccezione alla garanzia: il traffico su loopback non lascia la
+    # macchina per definizione, e il server verifica esplicitamente di essersi
+    # legato solo a 127.0.0.1.
+    "loopback: richiede l'interfaccia di loopback attiva",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

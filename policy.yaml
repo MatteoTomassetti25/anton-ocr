@@ -1,0 +1,84 @@
+# anton-ocr — policy di trattamento
+#
+# Questo file è evidenza, non configurazione. Il suo hash SHA-256 finisce in ogni
+# manifest: poter dimostrare quale regola era in vigore al momento
+# dell'elaborazione è metà del valore dell'audit trail. Tienilo versionato in git.
+#
+# Azioni disponibili:
+#   pseudonymize  sostituisce con un token reversibile (mappa nel vault cifrato)
+#   generalize    riduce la precisione invece di rimuovere (data → anno, ...)
+#   block         il documento non viene elaborato e finisce in quarantena
+#   review        il documento richiede conferma umana prima dell'uso
+#   keep          lascia invariato
+
+version: 1
+profile: gdpr-strict
+
+# pseudonymize = reversibile tramite vault (il dato resta dato personale, art. 4(5) GDPR)
+# anonymize    = irreversibile, nessun vault
+mode: pseudonymize
+
+entities:
+  # ── Identificatori diretti (validati con checksum) ──
+  - { type: IT_CODICE_FISCALE,    action: pseudonymize }
+  - { type: IT_PARTITA_IVA,       action: pseudonymize }
+  - { type: IT_TESSERA_SANITARIA, action: pseudonymize }
+  - { type: IBAN,                 action: pseudonymize }
+  - { type: CREDIT_CARD,          action: pseudonymize }
+  - { type: IT_TARGA,             action: pseudonymize }
+
+  # ── Contatti ──
+  - { type: EMAIL,                action: pseudonymize }
+  - { type: PHONE,                action: pseudonymize }
+  - { type: IP_ADDRESS,           action: pseudonymize }
+  - { type: MAC_ADDRESS,          action: pseudonymize }
+
+  # ── Quasi-identificatori ──
+  # Generalizzare invece di rimuovere mantiene il testo utilizzabile a valle,
+  # riducendo comunque il rischio di re-identificazione per combinazione.
+  - { type: PERSON,               action: pseudonymize }
+  - { type: ADDRESS,              action: generalize, to: municipality }
+  - { type: DATE_OF_BIRTH,        action: generalize, to: year }
+  - { type: ORGANIZATION,         action: keep }
+  - { type: LOCATION,             action: keep }
+  - { type: DATE,                 action: keep }
+
+  # ── Categorie particolari, art. 9 GDPR ──
+  # Default `block`, non `redact`: un referto medico privato dei nomi resta un
+  # referto medico, e la sua trasmissione richiede una base giuridica che questo
+  # strumento non può presumere.
+  - { type: GDPR_ART9_HEALTH,     action: block, reason: "Dati relativi alla salute — art. 9 GDPR" }
+  - { type: GDPR_ART9_BIOMETRIC,  action: block, reason: "Dati biometrici — art. 9 GDPR" }
+  - { type: GDPR_ART9_GENETIC,    action: block, reason: "Dati genetici — art. 9 GDPR" }
+  - { type: GDPR_ART9_RELIGION,   action: block, reason: "Convinzioni religiose — art. 9 GDPR" }
+  - { type: GDPR_ART9_POLITICAL,  action: block, reason: "Opinioni politiche — art. 9 GDPR" }
+  - { type: GDPR_ART9_SEXUAL,     action: block, reason: "Orientamento sessuale — art. 9 GDPR" }
+  - { type: GDPR_ART9_UNION,      action: block, reason: "Appartenenza sindacale — art. 9 GDPR" }
+
+default_action: pseudonymize
+
+thresholds:
+  # Sotto questa confidenza il documento va a revisione umana (art. 14 AI Act)
+  review_below_confidence: 0.75
+  # Se il rilevamento fallisce, il documento NON passa. Fail-closed: in un
+  # sistema di privacy degradare in silenzio significa perdere dati.
+  block_on_detection_error: true
+  fail_closed: true
+
+pseudonymization:
+  # `document` = salt per documento. Token stabili su un intero corpus
+  # permetterebbero di collegare fra loro documenti diversi, e il collegamento è
+  # di per sé un vettore di re-identificazione. Cambia solo se sai perché.
+  salt_scope: document
+  vault:
+    enabled: true
+    ttl_days: 90
+
+retention:
+  # ~7 anni. L'art. 11 AI Act richiede la conservazione della documentazione
+  # tecnica per 10 anni dall'immissione sul mercato: adegua al tuo contesto.
+  audit_log_days: 2555
+
+egress:
+  # Rifiuta di partire se i modelli non sono già in cache locale.
+  sealed: true

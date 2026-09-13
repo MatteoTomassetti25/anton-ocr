@@ -1,8 +1,32 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+build/
+dist/
 logs/
 *.log
 *.err
 .DS_Store
+.pytest_cache/
+.ruff_cache/
+
+# Configurazione locale — usa config.env.example come modello
+config.env
+
+# Dati locali: NON devono mai finire in git
+vault/
+*.vault
+input/
+output/
+elaborati/
+quarantine/
+review/
+audit.jsonl
+*.manifest.json
+
+# Chiavi di firma
+*.key
+signing_key*

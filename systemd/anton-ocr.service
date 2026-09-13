@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=__VENV_DIR__/bin/python -u __REPO_DIR__/ocr_daemon.py
+ExecStart=__VENV_DIR__/bin/python -u -m anton_ocr.daemon
 WorkingDirectory=__REPO_DIR__
 Restart=on-failure
 RestartSec=5

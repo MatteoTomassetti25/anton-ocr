@@ -52,7 +52,7 @@ def _unload_mlx_model():
 def load_config():
     cfg = {
         "INPUT_DIR":      str(Path(__file__).parent / "input"),
-        "OUTPUT_DIR":     "/Users/cmdhro/Matteo/wikiAnton/Università",
+        "OUTPUT_DIR":     str(Path.home() / ".anton-ocr" / "output"),
         "ARCHIVE_DIR":    str(Path(__file__).parent / "elaborati"),
         "MODEL":          "glm-ocr:latest",
         "DPI":            "150",
@@ -467,7 +467,7 @@ async def process_pdf(filepath: str):
             ocr_results = {}
             if ocr_tasks:
                 results = await asyncio.gather(*ocr_tasks.values())
-                ocr_results = dict(zip(ocr_tasks.keys(), results))
+                ocr_results = dict(zip(ocr_tasks.keys(), results, strict=False))
 
             for idx in chunk_slice:
                 task = classifications[idx]

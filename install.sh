@@ -82,8 +82,10 @@ fi
 info "Creazione virtualenv Python..."
 python3 -m venv "$VENV_DIR"
 "$VENV_DIR/bin/pip" install --upgrade pip -q
-"$VENV_DIR/bin/pip" install watchdog pdf2image ollama requests pillow -q
-ok "Dipendenze Python installate."
+# Installa il pacchetto con gli extra utili: estrazione PDF, daemon, backend OCR.
+# Il nucleo privacy dipende solo da cryptography e PyYAML.
+"$VENV_DIR/bin/pip" install -e "$REPO_DIR[pdf,daemon,ollama]" -q
+ok "anton-ocr installato nel virtualenv."
 
 # ---- 6. Setup config.env if not present ----
 if [ ! -f "$CONFIG_FILE" ]; then
@@ -92,8 +94,15 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 # Create default directories
-mkdir -p "$HOME/anton-ocr/input" "$HOME/anton-ocr/output" "$HOME/anton-ocr/elaborati"
-ok "Cartelle di lavoro create in ~/anton-ocr/"
+mkdir -p "$HOME/.anton-ocr"/{input,output,elaborati,vault,review,quarantine}
+chmod 700 "$HOME/.anton-ocr/vault"
+ok "Cartelle di lavoro create in ~/.anton-ocr/"
+
+# Il file di policy governa cosa viene pseudonimizzato, generalizzato o bloccato.
+if [ ! -f "$HOME/.anton-ocr/policy.yaml" ]; then
+    cp "$REPO_DIR/policy.yaml" "$HOME/.anton-ocr/policy.yaml" 2>/dev/null || true
+    ok "Policy predefinita (gdpr-strict) installata in ~/.anton-ocr/policy.yaml"
+fi
 
 # ---- 7. Install service ----
 if [ "$OS" = "Darwin" ]; then

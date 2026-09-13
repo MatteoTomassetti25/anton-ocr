@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[pdf,dev]'
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Test
+        run: pytest -q --cov=anton_ocr --cov-report=term-missing
+
+  no-egress:
+    name: Zero-egress (isolamento di rete reale)
+    runs-on: ubuntu-latest
+
+    # Questo è il job che sostiene l'affermazione "100% locale".
+    # La suite completa gira dentro un network namespace privo di rotta: se un
+    # qualunque componente della pipeline tenta di raggiungere la rete, il job
+    # fallisce. È una garanzia più forte del monkeypatching, perché non dipende
+    # dalla collaborazione del codice sotto test.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install (unica fase autorizzata a usare la rete)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[pdf,dev]'
+
+      - name: Verifica che l'isolamento sia effettivo
+        run: |
+          # Controllo del controllo: se questo comando riesce a raggiungere la
+          # rete, il job successivo non proverebbe nulla.
+          if unshare -rn python -c "
+          import socket, sys
+          try:
+              socket.create_connection(('1.1.1.1', 53), timeout=3)
+          except OSError:
+              sys.exit(0)
+          sys.exit(1)
+          "; then
+            echo '✓ network namespace effettivamente isolato'
+          else
+            echo '✗ isolamento di rete non attivo: il job non è affidabile'
+            exit 1
+          fi
+
+      - name: Suite senza rete
+        # Si escludono i test marcati `loopback`: avviano la GUI su 127.0.0.1 e
+        # in un namespace senza interfacce non esiste nemmeno `lo`. Non è
+        # un'eccezione alla garanzia — il traffico su loopback non lascia la
+        # macchina per definizione, e il server verifica di essersi legato solo
+        # a 127.0.0.1. L'intera pipeline di elaborazione è coperta.
+        run: unshare -rn python -m pytest -q -m "not loopback"
+
+  build:
+    name: Build del pacchetto
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip build twine
+      - run: python -m build
+      - run: python -m twine check dist/*
+
+  hygiene:
+    name: Igiene del repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Nessun percorso personale nel sorgente
+        run: |
+          # Regressione: config.env conteneva percorsi della macchina di
+          # sviluppo. Non deve più accadere.
+          if grep -rInE '/(Users|home)/[a-z0-9_-]+/' \
+               --include='*.py' --include='*.yaml' --include='*.yml' \
+               --include='*.toml' --include='*.env' --include='*.example' \
+               --include='*.sh' src/ tests/ *.yaml *.toml 2>/dev/null; then
+            echo '✗ trovati percorsi personali nel sorgente'
+            exit 1
+          fi
+          echo '✓ nessun percorso personale'
+
+      - name: config.env non deve essere tracciato
+        run: |
+          if git ls-files --error-unmatch config.env 2>/dev/null; then
+            echo '✗ config.env è tracciato da git: usa config.env.example'
+            exit 1
+          fi
+          echo '✓ config.env non tracciato'
+
+      - name: LICENSE presente
+        run: test -f LICENSE && echo '✓ LICENSE presente'
