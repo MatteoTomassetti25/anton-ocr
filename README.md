@@ -16,6 +16,11 @@ Pipeline documentale **interamente locale** che pseudonimizza i dati personali
 
 ---
 
+> [!WARNING]
+> **Progetto allo stato embrionale.** Funziona ed è in uso, ma è ancora incompleto:
+> l'API e la configurazione possono cambiare senza preavviso, alcune parti sono abbozzate
+> e i test non coprono tutto. Prendilo come lavoro in corso, non come software finito.
+
 ```
   ┌───────────────── CONFINE LOCALE (nessuna connessione di rete) ──────────────┐
   │                                                                             │
